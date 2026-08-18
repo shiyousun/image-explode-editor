@@ -397,46 +397,53 @@ def reread_text(image_path: str, rect: Tuple[float, float, float, float],
     analyze, _bgra, _scale = load_image(image_path, max_side=max_side)
     h, w = analyze.shape[:2]
     x, y, rw, rh = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
-    pad = max(4.0, min(rw, rh) * 0.18)
-    x0 = int(max(0, math.floor(x - pad)))
-    y0 = int(max(0, math.floor(y - pad)))
-    x1 = int(min(w, math.ceil(x + rw + pad)))
-    y1 = int(min(h, math.ceil(y + rh + pad)))
-    if x1 - x0 < 4 or y1 - y0 < 4:
-        return {"text": "", "conf": 0.0, "engine": "", "scales": [], "candidates": []}
-
-    crop = analyze[y0:y1, x0:x1]
-    ink_h = max(6.0, _ink_height(crop))
     names = ocr_engines.available_engine_names() if engine == "auto" else [engine]
-
-    # 一个尺度可能刚好把某个字认坏，多给两档（够大 / 更大）再投票
-    scales = sorted({round(float(np.clip(t / ink_h, 1.0, 10.0)), 2)
-                     for t in (target_height, target_height * 1.75)})
     pool: Dict[str, Dict] = {}
-    for s in scales:
-        img = crop if s <= 1.01 else cv2.resize(crop, None, fx=s, fy=s,
-                                                interpolation=cv2.INTER_LANCZOS4)
-        for name in names:
-            try:
-                lines, _used = ocr_engines.detect_text(img, engine=name,
-                                                       multi_scale=False, min_conf=0.05)
-            except Exception:  # noqa: BLE001  某个引擎挂了不该影响其它引擎
-                continue
-            if not lines:
-                continue
-            # 裁出来的是一行字，个别引擎会切成几段，按阅读顺序拼回去
-            lines.sort(key=lambda l: (round(l.bbox[1] / max(8.0, ink_h * s * 0.6)), l.bbox[0]))
-            text = "".join(l.text for l in lines).strip()
-            if not text:
-                continue
-            conf = float(sum(l.conf for l in lines) / len(lines))
-            slot = pool.setdefault(text, {"text": text, "conf": 0.0, "votes": 0,
-                                          "engines": [], "scales": []})
-            slot["conf"] = max(slot["conf"], round(conf, 4))
-            slot["votes"] += 1
-            if name not in slot["engines"]:
-                slot["engines"].append(name)
-            slot["scales"].append(s)
+    ink_h = max(6.0, rh)
+    all_scales: List[float] = []
+
+    # 裁得紧、裁得松各来一遍：贴着笔画裁容易掉笔锋（实测紧裁把「EUV光刻机」读成「机光效」），
+    # 留白太多又会把邻行也框进来。两种都认一遍，正确读法自然拿到更多票。
+    for pad_ratio in (0.18, 0.5):
+        pad = max(4.0, min(rw, rh) * pad_ratio)
+        x0 = int(max(0, math.floor(x - pad)))
+        y0 = int(max(0, math.floor(y - pad)))
+        x1 = int(min(w, math.ceil(x + rw + pad)))
+        y1 = int(min(h, math.ceil(y + rh + pad)))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            continue
+
+        crop = analyze[y0:y1, x0:x1]
+        ink_h = max(6.0, _ink_height(crop))
+        # 一个尺度可能刚好把某个字认坏，多给两档（够大 / 更大）再投票
+        scales = sorted({round(float(np.clip(t / ink_h, 1.0, 10.0)), 2)
+                         for t in (target_height, target_height * 1.75)})
+        all_scales.extend(scales)
+        for s in scales:
+            img = crop if s <= 1.01 else cv2.resize(crop, None, fx=s, fy=s,
+                                                    interpolation=cv2.INTER_LANCZOS4)
+            for name in names:
+                try:
+                    lines, _used = ocr_engines.detect_text(img, engine=name,
+                                                          multi_scale=False, min_conf=0.05)
+                except Exception:  # noqa: BLE001  某个引擎挂了不该影响其它引擎
+                    continue
+                if not lines:
+                    continue
+                # 裁出来的是一行字，个别引擎会切成几段，按阅读顺序拼回去
+                lines.sort(key=lambda l: (round(l.bbox[1] / max(8.0, ink_h * s * 0.6)),
+                                          l.bbox[0]))
+                text = "".join(l.text for l in lines).strip()
+                if not text:
+                    continue
+                conf = float(sum(l.conf for l in lines) / len(lines))
+                slot = pool.setdefault(text, {"text": text, "conf": 0.0, "votes": 0,
+                                              "engines": [], "scales": []})
+                slot["conf"] = max(slot["conf"], round(conf, 4))
+                slot["votes"] += 1
+                if name not in slot["engines"]:
+                    slot["engines"].append(name)
+                slot["scales"].append(s)
 
     candidates = sorted(pool.values(), key=lambda c: (-c["votes"], -c["conf"]))
     best = candidates[0] if candidates else {"text": "", "conf": 0.0, "engines": []}
@@ -445,7 +452,7 @@ def reread_text(image_path: str, rect: Tuple[float, float, float, float],
         "conf": best["conf"],
         "engine": (best.get("engines") or [""])[0],
         "inkHeight": round(ink_h, 1),
-        "scales": scales,
+        "scales": sorted(set(all_scales)),
         "candidates": candidates,
     }
 
