@@ -1,0 +1,15 @@
+# 虚拟环境（平台相关的二进制，换机器必须重建）
+venv/
+.venv/
+
+# 每次炸开的产物：切片、干净底图、layout.json、工程文件，可整个删掉
+workspace/
+
+# 运行时痕迹
+server.log
+.server.pid
+.server.*.pid
+
+__pycache__/
+*.pyc
+.DS_Store

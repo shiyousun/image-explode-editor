@@ -1,0 +1,22 @@
+# 图片炸开编辑器 —— Python 依赖
+# 安装：python3.12 -m venv venv && ./venv/bin/pip install -r requirements.txt
+
+fastapi==0.141.1
+uvicorn==0.52.1
+python-multipart==0.0.32
+
+# 服务器多为无图形环境，装带 GUI 的 opencv 会因缺 libGL.so.1 直接 import 失败
+opencv-python==5.0.0.93; sys_platform == "darwin"
+opencv-python-headless==5.0.0.93; sys_platform != "darwin"
+# numpy 2.5 起只发 3.12+ 的轮子，3.11 的机器（如 TencentOS 4.4）退到 2.4 分支
+numpy==2.5.2; python_version >= "3.12"
+numpy==2.4.6; python_version < "3.12"
+pillow==12.3.0
+
+# OCR 引擎（二选一即可，两个都装则优先用系统原生的 Vision）
+# macOS 原生 Vision：最准，中英文都好，无需下载模型；非 macOS 装不上，用标记跳过
+pyobjc-framework-Vision==12.2.2; sys_platform == "darwin"
+pyobjc-framework-Quartz==12.2.2; sys_platform == "darwin"
+# 跨平台兜底（Linux 上的实际引擎）：模型随 wheel 一起装，无需联网下载
+rapidocr-onnxruntime==1.4.4
+onnxruntime==1.28.0

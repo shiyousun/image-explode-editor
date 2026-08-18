@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>图片炸开编辑器 · Image Explode Editor</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">✦</span>
+    <div class="brand-text">
+      <strong>图片炸开编辑器</strong>
+      <small id="engineInfo">正在检测 OCR 引擎…</small>
+    </div>
+  </div>
+
+  <div class="toolgroup" id="mainTools">
+    <button class="tool" id="btnOpen" title="上传新图片"><span>⤒</span>上传</button>
+    <button class="tool" id="btnReexplode" title="用新参数重新炸开" disabled><span>⟳</span>重新炸开</button>
+    <span class="divider"></span>
+    <button class="tool" data-mode="select" title="选择 / 移动 (V)"><span>⬚</span>选择</button>
+    <button class="tool" data-mode="text" title="添加文字 (T)"><span>T</span>文字</button>
+    <button class="tool" data-mode="rect" title="添加矩形 (R)"><span>▭</span>矩形</button>
+    <button class="tool" data-mode="ellipse" title="添加椭圆 (O)"><span>◯</span>椭圆</button>
+    <button class="tool" data-mode="cutout" title="框选抠取元素：把图上任意区域变成独立图层"><span>✂</span>抠取</button>
+    <button class="tool" data-mode="erase" title="框选擦除：把区域内容按背景补干净"><span>◧</span>擦除</button>
+    <span class="divider"></span>
+    <button class="tool" id="btnUndo" title="撤销 (⌘Z)" disabled><span>↶</span></button>
+    <button class="tool" id="btnRedo" title="重做 (⇧⌘Z)" disabled><span>↷</span></button>
+  </div>
+
+  <div class="toolgroup right">
+    <button class="tool ghost" id="btnCompare" title="按住查看原图，用于核对保真度">⟷ 对比原图</button>
+    <span class="divider"></span>
+    <button class="tool" id="btnSaveProject" title="保存工程，稍后可继续编辑" disabled>存工程</button>
+    <button class="tool primary" id="btnExport" title="把改好的图片下载到本机硬盘" disabled>⤓ 下载图片</button>
+  </div>
+</header>
+
+<main class="workspace">
+  <!-- 左：图层面板 -->
+  <aside class="panel left" id="layerPanel">
+    <div class="panel-head">
+      <span>图层</span>
+      <span class="badge" id="layerCount">0</span>
+      <div class="head-actions">
+        <button class="mini" id="btnLayerUp" title="上移一层">▲</button>
+        <button class="mini" id="btnLayerDown" title="下移一层">▼</button>
+        <button class="mini danger" id="btnLayerDelete" title="删除图层">✕</button>
+      </div>
+    </div>
+    <div class="filter-row">
+      <input type="search" id="layerSearch" placeholder="搜索图层文字…">
+      <select id="layerFilter">
+        <option value="all">全部类型</option>
+        <option value="text">仅文字</option>
+        <option value="shape">仅形状</option>
+        <option value="image">仅图像</option>
+      </select>
+    </div>
+    <div class="layer-list" id="layerList"></div>
+  </aside>
+
+  <!-- 中：画布 -->
+  <section class="stage-wrap" id="stageWrap">
+    <div class="stage-scroll" id="stageScroll">
+      <canvas id="stage"></canvas>
+      <canvas id="overlay"></canvas>
+      <textarea id="inlineEditor" spellcheck="false"></textarea>
+    </div>
+
+    <div class="dropzone" id="dropzone">
+      <div class="dz-inner">
+        <div class="dz-icon">✦</div>
+        <h2>把图片拖到这里，或点击上传</h2>
+        <p>上传后会在右侧自动「炸开」成可编辑图层：文字变成真正的文字，色块变成可改颜色的形状，图像区域变成可替换的图片。</p>
+        <p class="dz-note">未编辑的部分与原图<strong>逐像素一致</strong>，只有你动过的元素才会重新绘制。</p>
+        <div class="dz-actions">
+          <button class="tool primary" id="btnPick">选择图片</button>
+          <button class="tool ghost" id="btnSample">用示例图试试</button>
+        </div>
+        <input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp,image/bmp,image/tiff" hidden>
+      </div>
+    </div>
+
+    <div class="stage-foot">
+      <div class="zoom-ctl">
+        <button class="mini" id="btnZoomOut">－</button>
+        <span id="zoomLabel">100%</span>
+        <button class="mini" id="btnZoomIn">＋</button>
+        <button class="mini wide" id="btnZoomFit">适应</button>
+        <button class="mini wide" id="btnZoom100">1:1</button>
+      </div>
+      <div class="hint" id="statusHint">拖拽移动 · 双击文字改内容 · ⌘滚轮缩放 · 空格拖拽平移</div>
+      <div class="canvas-meta" id="canvasMeta"></div>
+    </div>
+
+    <div class="marquee" id="marquee" hidden></div>
+  </section>
+
+  <!-- 右：属性面板 -->
+  <aside class="panel right" id="propPanel">
+    <div class="panel-head"><span>属性</span><span class="badge" id="selInfo">未选中</span></div>
+    <div class="prop-body" id="propBody">
+      <div class="empty-prop">
+        <p>选中左侧图层或画布上的元素后，在这里修改它的文字、颜色、字号、位置等。</p>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<!-- 炸开参数弹窗 -->
+<div class="modal-mask" id="explodeModal" hidden>
+  <div class="modal">
+    <h3>炸开参数</h3>
+    <label class="row">
+      <span>分割强度</span>
+      <select id="optStrength">
+        <option value="conservative">保守 · 只提取明显的大块元素</option>
+        <option value="standard" selected>标准 · 推荐</option>
+        <option value="aggressive">激进 · 尽可能多拆，可能有碎片</option>
+      </select>
+    </label>
+    <label class="row">
+      <span>OCR 引擎</span>
+      <select id="optEngine">
+        <option value="auto" selected>自动（优先系统原生，最准）</option>
+        <option value="macos-vision">macOS Vision</option>
+        <option value="rapidocr">RapidOCR</option>
+      </select>
+    </label>
+    <div class="row checks">
+      <label><input type="checkbox" id="optText" checked> 提取文字</label>
+      <label><input type="checkbox" id="optShapes" checked> 提取色块形状</label>
+      <label><input type="checkbox" id="optImages" checked> 提取图像/图标</label>
+    </div>
+    <label class="row">
+      <span>最长边上限</span>
+      <select id="optMaxSide">
+        <option value="1600">1600px · 最快</option>
+        <option value="3000" selected>3000px · 推荐</option>
+        <option value="4500">4500px · 高清大图</option>
+      </select>
+    </label>
+    <p class="modal-note">提高强度会拆出更多图层，但也更容易把渐变、纹理切碎。拆得不理想时，换个强度重新炸开即可，原图不会被改动。</p>
+    <div class="modal-actions">
+      <button class="tool ghost" id="btnExplodeCancel">取消</button>
+      <button class="tool primary" id="btnExplodeRun">开始炸开</button>
+    </div>
+  </div>
+</div>
+
+<!-- 导出弹窗 -->
+<div class="modal-mask" id="exportModal" hidden>
+  <div class="modal">
+    <h3>下载图片</h3>
+    <label class="row"><span>文件名</span><input type="text" id="expName" placeholder="my_edit"></label>
+    <label class="row">
+      <span>格式</span>
+      <select id="expFormat">
+        <option value="png" selected>PNG · 无损，支持透明</option>
+        <option value="jpeg">JPG · 体积小</option>
+        <option value="webp">WEBP · 体积更小</option>
+      </select>
+    </label>
+    <label class="row" id="expQualityRow" hidden>
+      <span>质量</span>
+      <input type="range" id="expQuality" min="50" max="100" value="92">
+      <output id="expQualityOut">92</output>
+    </label>
+    <label class="row">
+      <span>倍率</span>
+      <select id="expScale">
+        <option value="1" selected>1× 原分辨率</option>
+        <option value="2">2× 放大</option>
+      </select>
+    </label>
+    <div class="row checks" id="expToServerRow">
+      <label><input type="checkbox" id="expToServer" checked> 同时保存到服务端项目目录</label>
+    </div>
+    <p class="exp-hint" id="expHint"></p>
+    <div class="modal-actions">
+      <button class="tool ghost" id="btnExportCancel">取消</button>
+      <button class="tool primary" id="btnExportRun">⤓ 下载到本机</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-host" id="toastHost"></div>
+<div class="busy" id="busy" hidden><div class="spinner"></div><p id="busyText">处理中…</p></div>
+
+<script type="module" src="/static/js/main.js"></script>
+</body>
+</html>
