@@ -3,7 +3,7 @@
  */
 
 import {
-  clamp, hitLayer, layerBox, markDirty, toLocal, rectsIntersect,
+  clamp, hitLayer, inkHit, layerBox, markDirty, toLocal, rectsIntersect,
 } from './state.js';
 import { HANDLES, handlePositions, fontString } from './render.js';
 
@@ -80,14 +80,26 @@ export class CanvasController {
 
   /* ---------------- 命中测试 ---------------- */
 
+  /**
+   * 自上而下找第一个「真的画在这个点上」的图层，点在空处就什么都不选，跟 PS 一样。
+   *
+   * 只认包围盒的话，稀疏元素（图表区、光晕）的包围盒能占半屏，点它框里任何空白处都会选中它，
+   * 里面的小图标就永远点不着——这是「颗粒度太大」体感的另一半来源。
+   */
   hitTest(pt) {
     const layers = this.doc.layers;
     for (let i = layers.length - 1; i >= 0; i -= 1) {
       const l = layers[i];
       if (!l.visible || l.locked) continue;
-      if (hitLayer(l, pt.x, pt.y, 1)) return l;
+      if (inkHit(this.doc, l, pt.x, pt.y, 1)) return l;
     }
     return null;
+  }
+
+  /** 已选中的图层，只要点在它的选择框内就允许直接拖动（哪怕那里是透明的） */
+  hitSelected(pt) {
+    return this.selected.find((l) => !l.locked && l.visible
+      && hitLayer(l, pt.x, pt.y, 1)) || null;
   }
 
   hitHandle(pt) {
@@ -187,7 +199,7 @@ export class CanvasController {
       return;
     }
 
-    const target = this.hitTest(pt);
+    const target = this.hitTest(pt) || (e.shiftKey ? null : this.hitSelected(pt));
     if (!target) {
       if (!e.shiftKey) this.select([]);
       this.drag = { kind: 'marquee', start: pt, additive: e.shiftKey };
@@ -407,7 +419,7 @@ export class CanvasController {
       el.style.cursor = map[handle] || 'default';
       return;
     }
-    el.style.cursor = this.hover ? 'move' : 'default';
+    el.style.cursor = (this.hover || this.hitSelected(pt)) ? 'move' : 'default';
   }
 
   /* ---------------- 内联文字编辑 ---------------- */

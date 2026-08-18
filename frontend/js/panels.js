@@ -2,11 +2,34 @@
  * 左侧图层面板 + 右侧属性面板。
  */
 
-import { CJK_FONTS, LATIN_FONTS, markDirty, uid } from './state.js';
+import { markDirty, uid } from './state.js';
 import { defaultFont, textWidthDrift } from './render.js';
-import { availableCandidates } from './fontmatch.js';
+import { fontGroups } from './fontlib.js';
 
 const TYPE_LABEL = { text: '文字', shape: '形状', image: '图像' };
+
+/**
+ * 字体下拉：分组列出本机装了的字体，当前用的那个单独置顶。
+ *
+ * 自动识别出的字体名（如 "PingFang SC"）和候选表里的写法（带同族备选和通用兜底的整条
+ * font-family 链）文本上并不相同，所以不能靠字符串去候选表里找位置——置顶一份最省事，
+ * 也顺带让人一眼看到「现在用的是识别出来的哪个」。
+ */
+function fontOptions(l, current) {
+  const esc = (s) => escapeHtml(s);
+  const head = l.fontMatch
+    ? `识别字体 · ${l.fontMatch.label}（吻合 ${l.fontMatch.iou}%）`
+    : '当前字体';
+  let html = `<optgroup label="${esc(head)}"><option value='${esc(current)}' selected>`
+    + `${esc(current.replace(/"/g, '').split(',')[0])} ✓</option></optgroup>`;
+  for (const g of fontGroups(!!l.isCJK)) {
+    html += `<optgroup label="${esc(g.name)}">`
+      + g.fonts.map((f) => `<option value='${esc(f.value)}' style="font-family:${
+        esc(f.value)}">${esc(f.label)}</option>`).join('')
+      + '</optgroup>';
+  }
+  return html;
+}
 
 /* --------------------------------------------------------------------- */
 /* 图层面板                                                              */
@@ -314,19 +337,9 @@ export class PropPanel {
   }
 
   textSection(l) {
-    // 只列本机真的装了的字体：列一堆装不上的名字，选了也是退回兜底字体，等于骗人
-    const fonts = [...availableCandidates(!!l.isCJK), ...availableCandidates(!l.isCJK),
-                   ...(l.isCJK ? [...CJK_FONTS, ...LATIN_FONTS] : [...LATIN_FONTS, ...CJK_FONTS])];
     const current = l.fontFamily || defaultFont(l);
-    const seen = new Set();
-    const uniq = fonts.filter((f) => !seen.has(f.value) && seen.add(f.value));
-    if (!uniq.some((f) => f.value === current)) {
-      uniq.unshift({ value: current, label: current.replace(/"/g, '') });
-    }
+    const opts = fontOptions(l, current);
     const matchTag = l.fontMatch ? ` · 识别 ${l.fontMatch.label} ${l.fontMatch.score}%` : '';
-    const opts = uniq.map((f) => `<option value='${escapeHtml(f.value)}'${
-      f.value === current ? ' selected' : ''}>${f.label}${
-      l.fontMatch && f.value === current ? ' ✓' : ''}</option>`).join('');
     const scaled = l.oh > 0 ? l.fontSize * (l.h / l.oh) : l.fontSize;
     const drift = textWidthDrift(this.measureCtx, l);
 

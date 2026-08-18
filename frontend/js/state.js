@@ -301,6 +301,78 @@ export function hitLayer(l, px, py, pad = 0) {
       && p.y >= l.y - pad && p.y <= l.y + l.h + pad;
 }
 
+/* --------------------------------------------------------------------- */
+/* 墨迹命中：点在包围盒里不算命中，要点在这个元素真正画了东西的地方          */
+/* --------------------------------------------------------------------- */
+
+const alphaCache = new WeakMap();
+
+/**
+ * 取图层切片的 alpha 位图（缓存）。抠出来的元素包围盒是矩形，但内容常常只占一小块：
+ * 一整片图表区的墨迹只有 2%，全靠包围盒判命中的话，点画面上任何空白处都会选中它，
+ * 底下真正想选的小图标反而永远点不着——这就是「颗粒度太大」体感的另一半来源。
+ */
+function alphaMapOf(doc, l) {
+  const img = doc.images.get(l.sliceUrl);
+  if (!img || !img.naturalWidth) return null;
+  let m = alphaCache.get(l);
+  if (m && m.src === l.sliceUrl) return m;
+
+  // 别缩太狠：320px 的缩略图上，一条网格线的 alpha 会摊到周围三四个格子里，
+  // 于是点在网格之间的空处也会被判成命中，实测 981×532 的图表层就是这样把点击吞掉的。
+  const maxSide = 1024;
+  const k = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.max(1, Math.round(img.naturalWidth * k));
+  const h = Math.max(1, Math.round(img.naturalHeight * k));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, w, h);
+  const px = ctx.getImageData(0, 0, w, h).data;
+  const a = new Uint8Array(w * h);
+  for (let i = 0, j = 3; i < a.length; i++, j += 4) a[i] = px[j];
+  m = { src: l.sliceUrl, w, h, a };
+  alphaCache.set(l, m);
+  return m;
+}
+
+/**
+ * 元素是否在该点画了东西。允许 slack 个文档像素的容差，好让一像素宽的曲线也点得中；
+ * 文字层按墨迹框算（切片带了大片留白，标题的包围盒能左探一百多像素到黑边上），
+ * 矢量图元没有稀疏问题，直接按包围盒算。
+ */
+export function inkHit(doc, l, px, py, tol = 1, slack = 3) {
+  if (!hitLayer(l, px, py, tol)) return false;
+  if (l.type === 'text') {
+    if (!l.inkBox) return true;
+    const sx = l.ow > 0 ? l.w / l.ow : 1;
+    const sy = l.oh > 0 ? l.h / l.oh : 1;
+    const p = toLocal(l, px, py);
+    const bx = l.x + (l.inkBox[0] - l.ox) * sx;
+    const by = l.y + (l.inkBox[1] - l.oy) * sy;
+    return p.x >= bx - slack && p.x <= bx + l.inkBox[2] * sx + slack
+        && p.y >= by - slack && p.y <= by + l.inkBox[3] * sy + slack;
+  }
+  if (l.type !== 'image' || l.dirty) return true;
+  const m = alphaMapOf(doc, l);
+  if (!m) return true;
+  const p = toLocal(l, px, py);
+  const kx = m.w / Math.max(1e-6, l.w);
+  const ky = m.h / Math.max(1e-6, l.h);
+  const x0 = Math.round((p.x - l.x) * kx);
+  const y0 = Math.round((p.y - l.y) * ky);
+  const rx = Math.max(1, Math.round(slack * kx));
+  const ry = Math.max(1, Math.round(slack * ky));
+  for (let dy = -ry; dy <= ry; dy += 1) {
+    for (let dx = -rx; dx <= rx; dx += 1) {
+      const x = x0 + dx, y = y0 + dy;
+      if (x < 0 || y < 0 || x >= m.w || y >= m.h) continue;
+      if (m.a[y * m.w + x] > 24) return true;
+    }
+  }
+  return false;
+}
+
 /** 标记图层为已编辑：之后渲染会补掉它的原位并重新绘制 */
 export function markDirty(l) {
   l.dirty = true;

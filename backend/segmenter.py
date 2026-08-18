@@ -36,14 +36,27 @@ class Element:
     meta: Dict = field(default_factory=dict)
 
 
+# min_area_px 是最小面积的绝对上限，用来兜住「大图上小图标被按比例的门槛筛掉」：
+# 比例门槛在 3000px 宽的图上会涨到 55×55，一个 32px 的图标根本进不了候选池。
+# 两者取小，等于「比例说了算，但再严也不能严过这个像素数」。
 PRESETS = {
-    "conservative": dict(min_area_ratio=0.0018, max_area_ratio=0.62,
-                         color_levels=8, edge_low=70, edge_high=190, max_elements=40),
-    "standard": dict(min_area_ratio=0.0006, max_area_ratio=0.80,
-                     color_levels=12, edge_low=45, edge_high=140, max_elements=90),
-    "aggressive": dict(min_area_ratio=0.00018, max_area_ratio=0.92,
-                       color_levels=18, edge_low=25, edge_high=95, max_elements=180),
+    "conservative": dict(min_area_ratio=0.0018, max_area_ratio=0.62, min_area_px=900,
+                         min_side=10, color_levels=8, edge_low=70, edge_high=190,
+                         max_elements=40),
+    "standard": dict(min_area_ratio=0.0006, max_area_ratio=0.80, min_area_px=420,
+                     min_side=8, color_levels=12, edge_low=45, edge_high=140,
+                     max_elements=90),
+    "fine": dict(min_area_ratio=0.00035, max_area_ratio=0.86, min_area_px=260,
+                 min_side=7, color_levels=15, edge_low=35, edge_high=115,
+                 max_elements=140),
+    "aggressive": dict(min_area_ratio=0.00018, max_area_ratio=0.92, min_area_px=160,
+                       min_side=6, color_levels=18, edge_low=25, edge_high=95,
+                       max_elements=180),
 }
+
+
+def _min_area(cfg: dict, total: int) -> float:
+    return min(cfg["min_area_ratio"] * total, float(cfg.get("min_area_px", 1e9)))
 
 SHAPE_KINDS = ("rect", "rounded-rect", "ellipse", "line")
 
@@ -96,8 +109,9 @@ def _candidates_from_quantization(labels: np.ndarray, centers: np.ndarray,
                                   bg_label: int, cfg: dict) -> List[Candidate]:
     h, w = labels.shape
     total = h * w
-    min_area = cfg["min_area_ratio"] * total
+    min_area = _min_area(cfg, total)
     max_area = cfg["max_area_ratio"] * total
+    min_side = int(cfg.get("min_side", 6))
     out: List[Candidate] = []
     kernel = np.ones((3, 3), np.uint8)
 
@@ -114,7 +128,7 @@ def _candidates_from_quantization(labels: np.ndarray, centers: np.ndarray,
             if area < min_area or area > max_area:
                 continue
             cw, ch = int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT])
-            if cw < 6 or ch < 6:
+            if cw < min_side or ch < min_side:
                 continue
             cx, cy = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
             local = (comp[cy:cy + ch, cx:cx + cw] == i).astype(np.uint8) * 255
@@ -133,16 +147,25 @@ def _candidates_from_edges(image_bgr: np.ndarray, cfg: dict) -> List[Candidate]:
     edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
 
-    contours, _hier = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    min_area = cfg["min_area_ratio"] * total
+    # 边缘通道用 RETR_CCOMP 取到「外轮廓 + 它内部的洞」两层，再把洞里的内容单独送进候选池：
+    # 卡片/面板的外轮廓会把里面的图标整个圈进去，只取 EXTERNAL 的话，一张卡片上的三个图标
+    # 永远只能得到一个候选，也就是友哥说的「颗粒度太大，单个图标改不了」。
+    contours, hier = cv2.findContours(edges, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = _min_area(cfg, total)
     max_area = cfg["max_area_ratio"] * total
+    min_side = int(cfg.get("min_side", 6))
     out: List[Candidate] = []
-    for cnt in contours:
+    tree = hier[0] if hier is not None and len(hier) else []
+    for idx, cnt in enumerate(contours):
+        # CCOMP 的第二层是「洞的边界」，也就是外轮廓自己的内沿，跟外轮廓几乎重合，取了纯属重复；
+        # 真正嵌在洞里的物体（卡片里的图标）被 CCOMP 提回第一层，所以只留 parent == -1 的。
+        if len(tree) > idx and tree[idx][3] != -1:
+            continue
         area = cv2.contourArea(cnt)
         if area < min_area or area > max_area:
             continue
         x, y, cw, ch = cv2.boundingRect(cnt)
-        if cw < 8 or ch < 8:
+        if cw < min_side or ch < min_side:
             continue
         local = np.zeros((ch, cw), np.uint8)
         cv2.drawContours(local, [cnt - np.array([[x, y]])], -1, 255, thickness=cv2.FILLED)
@@ -213,6 +236,14 @@ def classify_element(image_bgr: np.ndarray, mask_local: np.ndarray, bbox: Rect,
     quantized = (pixels // 24).astype(np.int32) if pixels.size else np.empty((0, 3), np.int32)
     color_count = int(len(np.unique(quantized, axis=0))) if quantized.size else 0
 
+    # 平坦像素占比：区分「照片」和「图形」。照片处处是纹理，界面图形则大片纯色，
+    # 只在物体边界处有跳变。合并逻辑要靠它判断一个容器里的小块是独立物件还是照片碎屑。
+    gray_sub = cv2.cvtColor(sub_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    grad_sub = cv2.magnitude(cv2.Sobel(gray_sub, cv2.CV_32F, 1, 0, ksize=3),
+                             cv2.Sobel(gray_sub, cv2.CV_32F, 0, 1, ksize=3)) / 4.0
+    sel_grad = grad_sub[mask_local > 0]
+    flat_ratio = float(np.mean(sel_grad < 8.0)) if sel_grad.size else 1.0
+
     contours, _ = cv2.findContours(mask_local, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     kind = "image"
     radius = 0.0
@@ -250,6 +281,7 @@ def classify_element(image_bgr: np.ndarray, mask_local: np.ndarray, bbox: Rect,
                    meta={"rectFill": round(rect_fill, 3),
                          "colorStd": round(color_std, 2),
                          "circularity": round(circularity, 3),
+                         "flatRatio": round(flat_ratio, 3),
                          "vertices": vertices})
 
 
@@ -401,6 +433,75 @@ def _mask_overlap(a: Element, b: Element) -> Tuple[float, int]:
     return inter / smaller, smaller
 
 
+def _nested_child(big: Element, small: Element, max_ratio: float = 0.55,
+                  min_fill: float = 0.34, max_aspect: float = 6.0) -> bool:
+    """small 是不是「嵌在 big 里的独立小物体」，而不是 big 被切碎后的一块碎片。
+
+    三条判据缺一不可：
+
+    · 明显小一圈。碎片是把一个物体劈成尺寸相当的几块；子物体只占容器的百分之几。
+      之前这里用的是「big 填充率 > 0.88 才算容器」，可实测右侧那块面板量出来是 0.70
+      （描边和圆角把填充率拉了下来），于是三个图标全被并进面板，变成一个 248×531 的
+      巨块——正是友哥说的「太大了，单个图标改不了」。尺寸比不吃描边和圆角的亏。
+
+    · 子物体自己得像个物件：饱满（掩码填满自己的包围盒）、不细长。这一条同时挡住了
+      照片被拆碎的问题——照片里的一切都「嵌在照片里」，只按尺寸判的话一张风景照会被
+      切成八十多块天空和树叶，而它本该是一个整体。实测照片里那些量化碎片的填充率
+      几乎全在 0.01~0.19（颜色带在照片里是丝絮状的），而 UI 单元是 0.44~0.83
+      （图标卡、定位气泡都饱满地占满自己的框），中间是一道干净的空隙。
+
+      （试过用「轮廓是否压在真实的边上」来判，结果正好相反：照片里处处是纹理，
+      任何切法的轮廓都有 0.7~0.95 的边吻合度，反而比深色面板上的图标卡（0.09）更高，
+      那个指标测的其实是「周围有没有纹理」，不是「这是不是一个物件」。）
+    """
+    ba = big.bbox[2] * big.bbox[3]
+    sa = small.bbox[2] * small.bbox[3]
+    if ba <= 0 or sa / ba > max_ratio:
+        return False
+    sw, sh = small.bbox[2], small.bbox[3]
+    if max(sw, sh) / max(1, min(sw, sh)) > max_aspect:
+        return False
+    return small.meta.get("rectFill", 0.0) >= min_fill
+
+
+def _protected_nesting(elements: List[Element], max_children: int = 7,
+                       size_cv: float = 0.28) -> set:
+    """挑出「容器 → 独立子物件」这类不该合并的配对，同时防住照片被拆碎。
+
+    单看一对元素，「面板里的图标」和「镜片上的高光斑」长得一样：都比容器小得多、
+    都饱满、都嵌在里面。实测那张眼镜产品图里，镜片反光被切出十几块 fill 0.34~0.53 的
+    斑块，逐对判断时和图标卡没有区别（试过颜色数、精确同色占比、轮廓边吻合度、内部
+    平坦度，四个指标在两类之间都有重叠，分不开）。
+
+    真正的区别在「一个容器下有几个这样的子块」：界面结构是可数的——面板里三个图标卡、
+    卡片里一个图标，实测图形类最多 6 个；而纹理是切不完的，同一张照片里同时冒出
+    20、10、10、8 个。所以按数量判：少数几个就是结构，一大把就是纹理。
+
+    例外是图标阵列——十二宫格确实能有十二个子块，但它们尺寸高度一致；照片碎块的尺寸
+    从 24×40 到 685×651 参差不齐。所以数量超标时再看尺寸离散度，齐整的照旧保护。
+    """
+    kids: Dict[int, List[int]] = {}
+    for i, big in enumerate(elements):
+        for j, small in enumerate(elements):
+            if i == j or not _contains(big.bbox, small.bbox):
+                continue
+            if _nested_child(big, small):
+                kids.setdefault(i, []).append(j)
+
+    protected = set()
+    for i, lst in kids.items():
+        if len(lst) > max_children:
+            sides = [math.sqrt(elements[j].bbox[2] * elements[j].bbox[3]) for j in lst]
+            mean = sum(sides) / len(sides)
+            var = sum((s - mean) ** 2 for s in sides) / len(sides)
+            if mean <= 0 or math.sqrt(var) / mean > size_cv:
+                continue
+        for j in lst:
+            protected.add((i, j))
+            protected.add((j, i))
+    return protected
+
+
 def consolidate_fragments(image_bgr: np.ndarray, elements: List[Element],
                           text_guard: Optional[np.ndarray] = None,
                           overlap_thresh: float = 0.34,
@@ -416,7 +517,7 @@ def consolidate_fragments(image_bgr: np.ndarray, elements: List[Element],
     判定用掩码交集占较小者的比例，也就是「它们是否真的共用同一批墨迹像素」。
     三条护栏防止过度合并：
       · 干净的可编辑图元（矩形/圆角矩形/椭圆/线）一律不并——并了就没法改填充色和圆角了；
-      · 大的实心块包住小元素时不并，否则面板会把里面的图标吞掉；
+      · 大块包住明显小一圈的元素时不并（见 _nested_child），否则面板会把里面的图标吞掉；
       · 合并结果超过整图 58% 时不并，否则背景会把前景全吃进去，反而更不好用。
     """
     current = list(elements)
@@ -435,6 +536,7 @@ def consolidate_fragments(image_bgr: np.ndarray, elements: List[Element],
                 i = parent[i]
             return i
 
+        protected = _protected_nesting(current)
         merged_any = False
         for i in range(n):
             for j in range(i + 1, n):
@@ -443,9 +545,7 @@ def consolidate_fragments(image_bgr: np.ndarray, elements: List[Element],
                     continue
                 if _bbox_iou(ei.bbox, ej.bbox) <= 0.0:
                     continue
-
-                big, small = (ei, ej) if ei.area_ratio >= ej.area_ratio else (ej, ei)
-                if _contains(big.bbox, small.bbox) and big.meta.get("rectFill", 0) > 0.88:
+                if (i, j) in protected:
                     continue
 
                 ratio, _ = _mask_overlap(ei, ej)
@@ -486,7 +586,8 @@ def consolidate_fragments(image_bgr: np.ndarray, elements: List[Element],
 
 
 def drop_slivers(image_bgr: np.ndarray, elements: List[Element],
-                 min_side_ratio: float = 0.012, floor: int = 12) -> List[Element]:
+                 min_side_ratio: float = 0.012, floor: int = 12,
+                 long_aspect: float = 8.0) -> List[Element]:
     """丢掉细如发丝的条状候选（分隔线、刻度线、卡片描边）。
 
     这类元素短边只有几个像素，掩码几乎填满整个包围盒，于是切片里 85% 是它周围的背景色。
@@ -494,14 +595,106 @@ def drop_slivers(image_bgr: np.ndarray, elements: List[Element],
     图标身上会横着一道暗条，看着像是被切断了。
 
     它们本来也不是友哥说的「主要素」：选不中、挪了看不出、删了没区别。留在底图里最合适。
+
+    长宽比越夸张，越容不下「其实是个小物件」的可能：20:1 的东西只能是线，不会是图标。
+    所以极端细长的（默认 8:1 以上）把厚度门槛放宽一倍，把分隔线、坐标轴、进度条底槽
+    这类一并归到底图里去。
     """
     ih, iw = image_bgr.shape[:2]
     limit = max(floor, int(round(min_side_ratio * min(ih, iw))))
     out: List[Element] = []
     for el in elements:
         _x, _y, w, h = el.bbox
-        if min(w, h) < limit and max(w, h) >= 3 * min(w, h):
+        short, long_ = min(w, h), max(w, h)
+        aspect = long_ / max(1, short)
+        if short < limit and aspect >= 3:
             continue
+        if short < limit * 2 and aspect >= long_aspect:
+            continue
+        out.append(el)
+    return out
+
+
+def surround_contrast(image_bgr: np.ndarray, el: Element, band: int = 6) -> float:
+    """元素自身颜色与紧邻外圈颜色的距离，衡量它在画面上「看不看得出来」。
+
+    取掩码内的中位色与外扩一圈的中位色比。用中位数而不是均值，是为了不被元素内部的
+    文字或高光带偏。
+    """
+    ih, iw = image_bgr.shape[:2]
+    x, y, w, h = el.bbox
+    x0, y0 = max(0, x - band), max(0, y - band)
+    x1, y1 = min(iw, x + w + band), min(ih, y + h + band)
+    sub = image_bgr[y0:y1, x0:x1]
+    full = np.zeros(sub.shape[:2], np.uint8)
+    full[y - y0:y - y0 + h, x - x0:x - x0 + w] = el.mask
+    outer = cv2.dilate(full, np.ones((band * 2 + 1, band * 2 + 1), np.uint8))
+    ring = cv2.bitwise_and(outer, cv2.bitwise_not(full))
+    inside = sub[full > 0]
+    around = sub[ring > 0]
+    if inside.size == 0 or around.size == 0:
+        return 999.0
+    return float(np.linalg.norm(np.median(inside.astype(np.float32), axis=0)
+                                - np.median(around.astype(np.float32), axis=0)))
+
+
+def boundary_support(image_bgr: np.ndarray, el: Element, grad: Optional[np.ndarray] = None,
+                     band: int = 2) -> float:
+    """元素轮廓上的平均梯度 ÷ 全图平均梯度，衡量它的边界是不是画面里真实存在的边。
+
+    看得见的物体，边界处必有一道明显的亮度跳变；而颜色量化在平滑渐变里切出来的块，
+    边界只是等值线，那里的梯度和周围一样平——这是区分「一块卡片」和「一片背景」的
+    最直接证据。
+    """
+    if grad is None:
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        grad = cv2.magnitude(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+                             cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    ih, iw = image_bgr.shape[:2]
+    x, y, w, h = el.bbox
+    pad = band + 1
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(iw, x + w + pad), min(ih, y + h + pad)
+    full = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    full[y - y0:y - y0 + h, x - x0:x - x0 + w] = el.mask
+    k = np.ones((band * 2 + 1, band * 2 + 1), np.uint8)
+    edge = cv2.bitwise_xor(cv2.dilate(full, k), cv2.erode(full, k))
+    sel = grad[y0:y1, x0:x1][edge > 0]
+    if sel.size == 0:
+        return 0.0
+    img_mean = float(np.mean(grad)) or 1.0
+    return float(np.mean(sel)) / img_mean
+
+
+def frame_ratio(el: Element) -> float:
+    """墨迹落在包围盒边框附近的比例。接近 1 说明它只是个空心方框。"""
+    _x, _y, w, h = el.bbox
+    ink = int(np.count_nonzero(el.mask))
+    if ink == 0:
+        return 0.0
+    band = max(3, int(round(0.03 * min(w, h))))
+    if w <= band * 2 or h <= band * 2:
+        return 1.0
+    inner = el.mask[band:h - band, band:w - band]
+    return 1.0 - int(np.count_nonzero(inner)) / ink
+
+
+def drop_invisible_blocks(image_bgr: np.ndarray, elements: List[Element],
+                          min_contrast: float = 12.0) -> List[Element]:
+    """丢掉与周围颜色几乎一样、根本看不出边界的候选。
+
+    深色渐变背景上，颜色量化会切出一堆规整的矩形，边缘检测也会沿着渐变等值线圈出空框。
+    它们在画面上完全隐形：挪走看不出、删掉看不出，只会占着图层列表，还挡住底下真正
+    想选的东西。按定义，一个与周围色差可忽略的块，删了不影响画面，所以丢它是安全的。
+
+    真实物体的色差是这个量级之上的：图表曲线 60+，图标卡片 30+，而幽灵矩形只有 2~8。
+    """
+    out: List[Element] = []
+    for el in elements:
+        c = surround_contrast(image_bgr, el)
+        if c < min_contrast:
+            continue
+        el.meta["contrast"] = round(c, 1)
         out.append(el)
     return out
 
@@ -610,6 +803,7 @@ def segment_elements(image_bgr: np.ndarray,
     elements = consolidate_fragments(image_bgr, elements, text_guard)
     elements = drop_background_crops(image_bgr, elements)
     elements = drop_slivers(image_bgr, elements)
+    elements = drop_invisible_blocks(image_bgr, elements)
     elements = _dedupe(elements, iou_thresh=0.55)
     elements.sort(key=lambda e: -(e.bbox[2] * e.bbox[3]))
     elements = elements[: cfg["max_elements"]]

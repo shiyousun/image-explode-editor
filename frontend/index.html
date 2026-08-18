@@ -117,11 +117,12 @@
   <div class="modal">
     <h3>炸开参数</h3>
     <label class="row">
-      <span>分割强度</span>
+      <span>分割颗粒度</span>
       <select id="optStrength">
-        <option value="conservative">保守 · 只提取明显的大块元素</option>
-        <option value="standard" selected>标准 · 推荐</option>
-        <option value="aggressive">激进 · 尽可能多拆，可能有碎片</option>
+        <option value="conservative">粗 · 只提取明显的大块元素</option>
+        <option value="standard" selected>标准 · 推荐，单个图标独立成层</option>
+        <option value="fine">精细 · 连小徽标、小气泡都拆出来</option>
+        <option value="aggressive">最细 · 尽可能多拆，会有碎片</option>
       </select>
     </label>
     <label class="row">
