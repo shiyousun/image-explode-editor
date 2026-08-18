@@ -215,6 +215,8 @@ def save_image(payload: Dict = Body(...)) -> Dict:
         ext = ".jpg"
     elif "webp" in header:
         ext = ".webp"
+    elif "svg" in header:
+        ext = ".svg"
     if not filename.lower().endswith(ext):
         filename = os.path.splitext(filename)[0] + ext
 

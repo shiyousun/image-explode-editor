@@ -319,22 +319,32 @@ function snapInkLeft(ctx, layer, g, firstLine) {
   return bearing < 0 ? g.anchorX + bearing : g.anchorX;
 }
 
-function drawVectorText(ctx, layer) {
+/** 每个字的落笔横坐标（手动字距时逐字画，位置得自己累计） */
+function glyphXs(ctx, text, x, spacing) {
+  const xs = [];
+  let cx = x;
+  for (const ch of [...text]) {
+    xs.push(cx);
+    cx += ctx.measureText(ch).width + spacing;
+  }
+  return xs;
+}
+
+/**
+ * 矢量文字排版的唯一出处：字号、字距、每行每字落在哪。
+ *
+ * Canvas 绘制和 SVG 导出都读这一份。自动贴合会连着改字号和字距，基线和左沿还各有一套
+ * 补正，两边各算一遍迟早对不上——导出的矢量图就会和屏幕上差半个字。
+ *
+ * 传进来的 ctx 只用于测量，函数结束时状态复原。
+ */
+export function textPlan(ctx, layer) {
   const g = textGeometry(layer);
   const lines = String(layer.text ?? '').split('\n');
   ctx.save();
-  ctx.translate(layer.x, layer.y);
-  // 非等比缩放时，横向再补一次比例，避免文字被压扁/拉长得不自然
-  const stretch = g.sy > 0 ? g.sx / g.sy : 1;
-  if (Math.abs(stretch - 1) > 0.01) {
-    ctx.translate(g.anchorX, 0);
-    ctx.scale(stretch, 1);
-    ctx.translate(-g.anchorX, 0);
-  }
-
   let size = g.size;
   ctx.font = fontString(layer, size);
-  ctx.textAlign = layer.align === 'center' ? 'center' : (layer.align === 'right' ? 'right' : 'left');
+  ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
 
   let spacing = (layer.letterSpacing || 0) * g.sy;
@@ -355,48 +365,73 @@ function drawVectorText(ctx, layer) {
   const lineStep = size * (layer.lineHeight || 1.25);
   const baseline = snapBaseline(ctx, layer, g, lines[0]);
   const anchorX = snapInkLeft(ctx, layer, g, lines[0]);
-  lines.forEach((line, i) => {
-    const y = baseline + i * lineStep;
-    // 手动字距时 textAlign 失效，需自己算行首位置
+  const plan = lines.map((line, i) => {
+    // 一律自己算行首，不借 textAlign：手动字距下它本来就失效，两条路子并存容易走岔
     let x = anchorX;
-    if (spacing) {
+    if (layer.align === 'center' || layer.align === 'right') {
       const w = measureRun(ctx, line, spacing);
-      if (layer.align === 'center') x = g.anchorX - w / 2;
-      else if (layer.align === 'right') x = g.anchorX - w;
-      ctx.textAlign = 'left';
+      x = layer.align === 'center' ? g.anchorX - w / 2 : g.anchorX - w;
     }
+    return {
+      text: line,
+      x,
+      y: baseline + i * lineStep,
+      glyphs: spacing ? glyphXs(ctx, line, x, spacing) : null,
+    };
+  });
+  ctx.restore();
+
+  return {
+    size,
+    spacing,
+    lineStep,
+    lines: plan,
+    scaleY: g.sy,
+    inkW: g.inkW,
+    family: layer.fontFamily || defaultFont(layer),
+    // 非等比缩放时横向再补一次比例，避免文字被压扁/拉长得不自然
+    stretch: g.sy > 0 ? g.sx / g.sy : 1,
+    stretchAnchor: g.anchorX,
+  };
+}
+
+function drawVectorText(ctx, layer) {
+  const plan = textPlan(ctx, layer);
+  ctx.save();
+  ctx.translate(layer.x, layer.y);
+  if (Math.abs(plan.stretch - 1) > 0.01) {
+    ctx.translate(plan.stretchAnchor, 0);
+    ctx.scale(plan.stretch, 1);
+    ctx.translate(-plan.stretchAnchor, 0);
+  }
+  ctx.font = fontString(layer, plan.size);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+
+  for (const line of plan.lines) {
     if (layer.strokeWidth > 0) {
       ctx.strokeStyle = layer.strokeColor || '#fff';
-      ctx.lineWidth = layer.strokeWidth * g.sy;
+      ctx.lineWidth = layer.strokeWidth * plan.scaleY;
       ctx.lineJoin = 'round';
-      drawRun(ctx, line, x, y, spacing, 'stroke');
+      drawRun(ctx, line.text, line.x, line.y, plan.spacing, 'stroke');
     }
     ctx.fillStyle = layer.color || '#000';
-    drawRun(ctx, line, x, y, spacing, 'fill');
-  });
+    drawRun(ctx, line.text, line.x, line.y, plan.spacing, 'fill');
+  }
   ctx.restore();
 }
 
 /** 供属性面板显示：矢量重排后的宽度与原始宽度的差异百分比 */
 export function textWidthDrift(ctx, layer) {
   if (layer.type !== 'text') return 0;
-  const g = textGeometry(layer);
-  ctx.save();
-  ctx.font = fontString(layer, g.size);
+  const plan = textPlan(ctx, layer);
   const lines = String(layer.text ?? '').split('\n');
   const longest = lines.reduce((a, b) => (b.length > a.length ? b : a), '');
-  let spacing = (layer.letterSpacing || 0) * g.sy;
-  if (layer.autoFit) {
-    spacing += computeFitSpacing(ctx, { ...layer, fontSize: g.size, letterSpacing: spacing }, g.inkW);
-    const scale = fitScale(ctx, layer, g, spacing);
-    if (scale < 1) {
-      ctx.font = fontString(layer, g.size * scale);
-      spacing *= scale;
-    }
-  }
-  const w = measureInkRun(ctx, longest, spacing);
+  ctx.save();
+  ctx.font = fontString(layer, plan.size);
+  const w = measureInkRun(ctx, longest, plan.spacing);
   ctx.restore();
-  return g.inkW > 0 ? (w - g.inkW) / g.inkW : 0;
+  return plan.inkW > 0 ? (w - plan.inkW) / plan.inkW : 0;
 }
 
 /* --------------------------------------------------------------------- */

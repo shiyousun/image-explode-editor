@@ -13,6 +13,7 @@ import {
 import { CanvasController } from './interact.js';
 import { LayerPanel, PropPanel } from './panels.js';
 import { calibrateFonts, scoreText } from './fontmatch.js';
+import { buildSvg, vectorLayers } from './svgexport.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -163,7 +164,10 @@ class App {
 
     // 导出弹窗
     $('expFormat').onchange = (e) => {
-      $('expQualityRow').hidden = e.target.value === 'png';
+      const svg = e.target.value === 'svg';
+      $('expQualityRow').hidden = svg || e.target.value === 'png';
+      $('expScaleLabel').textContent = svg ? '底图倍率' : '倍率';
+      this.exportHint(svg);
     };
     $('expQuality').oninput = (e) => { $('expQualityOut').textContent = e.target.value; };
     $('btnExportCancel').onclick = () => { $('exportModal').hidden = true; };
@@ -913,10 +917,29 @@ class App {
     $('expName').value = `${this.doc.name || 'image'}_edited`;
     $('expToServerRow').hidden = IS_REMOTE;
     if (IS_REMOTE) $('expToServer').checked = false;
-    $('expHint').innerHTML = IS_REMOTE
-      ? `远程访问 <b>${location.host}</b>：图片直接下载到<b>你这台电脑</b>的「下载」文件夹，不写服务器磁盘。`
-      : '图片会下载到本机「下载」文件夹。';
+    this.exportHint($('expFormat').value === 'svg');
     $('exportModal').hidden = false;
+  }
+
+  /** 导出弹窗底部那行说明：远程/本地各一句，选了 SVG 再补一句矢量能到什么程度 */
+  exportHint(svg) {
+    const where = IS_REMOTE
+      ? `远程访问 <b>${location.host}</b>：文件直接下载到<b>你这台电脑</b>的「下载」文件夹，不写服务器磁盘。`
+      : '文件会下载到本机「下载」文件夹。';
+    if (!svg) { $('expHint').innerHTML = where; return; }
+    const n = this.doc.isReady ? vectorLayers(this.doc).length : 0;
+    const raw = this.doc.isReady
+      ? this.doc.layers.filter((l) => l.type === 'text' && l.visible && l.textMode === 'pixel').length
+      : 0;
+    const vec = n
+      ? `改过的 <b>${n}</b> 层导成真矢量（文字仍是文字，可在 Illustrator / Figma 里改字改色）；`
+        + '没动过的部分仍是原图像素，按上面的倍率嵌进去。'
+      : '当前还没有改过的图层，导出的 SVG 里只有一张原图像素，没有可编辑的矢量对象。';
+    const more = raw
+      ? `<br>还有 <b>${raw}</b> 段文字是原图像素，想让它们也变成可编辑矢量，`
+        + '先按 <b>⌘K</b>（文字转清晰）再导出。'
+      : '';
+    $('expHint').innerHTML = `${where}<br>${vec}${more}`;
   }
 
   async runExport() {
@@ -927,34 +950,48 @@ class App {
     const name = ($('expName').value || 'export').trim();
     const toServer = !IS_REMOTE && $('expToServer').checked;
 
-    this.busy(true, '正在生成图片…');
+    this.busy(true, format === 'svg' ? '正在生成矢量图…' : '正在生成图片…');
     try {
-      const bg = format === 'jpeg' ? '#ffffff' : null;
-      const canvas = renderToCanvas(this.doc, scale, bg);
-      const mime = { png: 'image/png', jpeg: 'image/jpeg', webp: 'image/webp' }[format];
-      const quality2 = format === 'png' ? undefined : quality;
-      const ext = { png: 'png', jpeg: 'jpg', webp: 'webp' }[format];
-      const filename = `${name}.${ext}`;
+      const out = format === 'svg'
+        ? this.svgBlob(scale)
+        : await this.rasterBlob(format, scale, quality);
+      const filename = `${name}.${out.ext}`;
+      downloadBlob(out.blob, filename);
 
-      const blob = await canvasBlob(canvas, mime, quality2);
-      downloadBlob(blob, filename);
-
+      const size = `（${fmtSize(out.blob.size)}${out.note ? `，${out.note}` : ''}）`;
       if (toServer) {
         const res = await fetch('/api/save-image', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ dataUrl: canvas.toDataURL(mime, quality2), filename }),
+          body: JSON.stringify({ dataUrl: await blobDataUrl(out.blob), filename }),
         });
         const saved = await this.parse(res);
-        this.toast(`已下载到本机，并存了一份到项目目录：${saved.name}`, 'ok');
+        this.toast(`已下载到本机，并存了一份到项目目录：${saved.name}${size}`, 'ok');
       } else {
-        this.toast(`已下载到本机：${filename}（${fmtSize(blob.size)}）`, 'ok');
+        this.toast(`已下载到本机：${filename}${size}`, 'ok');
       }
       this.busy(false);
     } catch (err) {
       this.busy(false);
       this.toast(`导出失败：${err.message}`, 'err');
     }
+  }
+
+  async rasterBlob(format, scale, quality) {
+    const bg = format === 'jpeg' ? '#ffffff' : null;
+    const canvas = renderToCanvas(this.doc, scale, bg);
+    const mime = { png: 'image/png', jpeg: 'image/jpeg', webp: 'image/webp' }[format];
+    const blob = await canvasBlob(canvas, mime, format === 'png' ? undefined : quality);
+    return { blob, ext: { png: 'png', jpeg: 'jpg', webp: 'webp' }[format] };
+  }
+
+  svgBlob(scale) {
+    const { svg, vectorCount } = buildSvg(this.doc, { rasterScale: scale });
+    return {
+      blob: new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }),
+      ext: 'svg',
+      note: vectorCount ? `${vectorCount} 层可编辑矢量` : '无可编辑矢量层',
+    };
   }
 
   async saveProject() {
@@ -1004,6 +1041,16 @@ function canvasBlob(canvas, mime, quality) {
   return new Promise((resolve, reject) => {
     canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('浏览器生成图片失败'))),
                   mime, quality);
+  });
+}
+
+/** Blob → data: URL（存服务端那条路要的格式）。大文件靠 FileReader 分块转，不会爆栈。 */
+function blobDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result);
+    fr.onerror = () => reject(new Error('读取导出结果失败'));
+    fr.readAsDataURL(blob);
   });
 }
 

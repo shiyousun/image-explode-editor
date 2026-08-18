@@ -167,6 +167,7 @@
         <option value="png" selected>PNG · 无损，支持透明</option>
         <option value="jpeg">JPG · 体积小</option>
         <option value="webp">WEBP · 体积更小</option>
+        <option value="svg">SVG · 矢量，文字形状可再编辑</option>
       </select>
     </label>
     <label class="row" id="expQualityRow" hidden>
@@ -175,7 +176,7 @@
       <output id="expQualityOut">92</output>
     </label>
     <label class="row">
-      <span>倍率</span>
+      <span id="expScaleLabel">倍率</span>
       <select id="expScale">
         <option value="1" selected>1× 原分辨率</option>
         <option value="2">2× 放大</option>
