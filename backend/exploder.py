@@ -85,6 +85,17 @@ def _rects_overlap(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -
     return not (ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay)
 
 
+def _contains(outer: Sequence[float], inner: Sequence[float], ratio: float) -> bool:
+    """inner 有 ratio 以上的面积落在 outer 里。"""
+    ax, ay, aw, ah = outer
+    bx, by, bw, bh = inner
+    x1, y1 = max(ax, bx), max(ay, by)
+    x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    if x2 <= x1 or y2 <= y1:
+        return False
+    return (x2 - x1) * (y2 - y1) >= bw * bh * ratio
+
+
 def _layer_name(text: str, limit: int = 12) -> str:
     flat = " ".join(text.split())
     return flat if len(flat) <= limit else flat[:limit] + "…"
@@ -144,7 +155,9 @@ def explode(image_path: str,
         kept_lines.append(line)
 
     text_regions: List[Tuple[np.ndarray, Tuple[int, int, int, int]]] = [
-        (inpainter.fill_large_holes(res.mask), res.patch_rect) for res in analyses
+        (inpainter.fill_large_holes(
+            res.erase_mask if res.erase_mask is not None else res.mask), res.patch_rect)
+        for res in analyses
     ]
     text_mask_union = np.zeros((h, w), np.uint8)
     for mask_local, rect in text_regions:
@@ -153,14 +166,6 @@ def explode(image_path: str,
 
     styles = [res.style for res in analyses]
     style_infer.normalize_weights(styles)
-    groups = style_infer.group_paragraphs(kept_lines, styles) if kept_lines else []
-    para_of: Dict[int, int] = {}
-    align_of: Dict[int, str] = {}
-    for gi, group in enumerate(groups):
-        align = style_infer.infer_alignment(kept_lines, group)
-        for idx in group:
-            para_of[idx] = gi
-            align_of[idx] = align
 
     # ---------------- 非文字元素 ---------------- #
     elements: List[segmenter.Element] = []
@@ -172,6 +177,41 @@ def explode(image_path: str,
             elements = [e for e in elements if e.kind in ("image", "icon")]
         if not detect_images:
             elements = [e for e in elements if e.kind not in ("image", "icon")]
+
+    # ---------------- 剔掉图标里的假文字 ---------------- #
+    # OCR 会把图标内部的图形当字读（实测一个齿轮图标被读成「5」）。留着它有三重坏处：
+    # 图层列表多一条垃圾、干净底图会把图标挖掉一块、批量转清晰时真的把「5」画到图标上。
+    # 短、置信度低、又整个躺在一个小图标里，三条同时满足才剔除，正常的图上文字不会中招。
+    icon_boxes = [e.bbox for e in elements
+                  if e.kind in ("icon", "image") and e.area_ratio < 0.02]
+    if icon_boxes:
+        keep_idx = []
+        for idx, (line, res) in enumerate(zip(kept_lines, analyses)):
+            ink = res.style.ink_bbox
+            if (len([c for c in line.text if not c.isspace()]) <= 2
+                    and line.conf < 0.6
+                    and any(_contains(box, ink, 0.85) for box in icon_boxes)):
+                continue
+            keep_idx.append(idx)
+        if len(keep_idx) < len(kept_lines):
+            kept_lines = [kept_lines[i] for i in keep_idx]
+            analyses = [analyses[i] for i in keep_idx]
+            text_regions = [text_regions[i] for i in keep_idx]
+            text_boxes = [rect for _, rect in text_regions]
+            text_mask_union = np.zeros((h, w), np.uint8)
+            for mask_local, rect in text_regions:
+                _stamp_mask(text_mask_union, mask_local, rect)
+            styles = [res.style for res in analyses]
+
+    # 段落分组要在剔除之后做，否则对齐方式会按旧下标错位到别的行上
+    groups = style_infer.group_paragraphs(kept_lines, styles) if kept_lines else []
+    para_of: Dict[int, int] = {}
+    align_of: Dict[int, str] = {}
+    for gi, group in enumerate(groups):
+        align = style_infer.infer_alignment(kept_lines, group)
+        for idx in group:
+            para_of[idx] = gi
+            align_of[idx] = align
 
     # ---------------- 分级干净背景 ---------------- #
     # clean_text：只擦文字，保留横幅/卡片等底板 —— 文字被移动或改写时用它打补丁，
@@ -325,6 +365,88 @@ def extract_region(image_path: str, job_dir: str, rect: Tuple[int, int, int, int
         "slice": f"layers/{lid}.png",
         "sliceRect": [float(x), float(y), float(bw), float(bh)],
         "kind": "manual",
+    }
+
+
+def _ink_height(crop_bgr: np.ndarray) -> float:
+    """估计裁片里字的实际墨迹高度（不含留白），用来定放大倍数。"""
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _t, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 文字可能是亮底暗字也可能是暗底亮字，占比少的那一类才是笔画
+    if int((binary > 0).sum()) * 2 > binary.size:
+        binary = cv2.bitwise_not(binary)
+    rows = np.where(binary.any(axis=1))[0]
+    if rows.size < 2:
+        return float(crop_bgr.shape[0])
+    return float(rows[-1] - rows[0] + 1)
+
+
+def reread_text(image_path: str, rect: Tuple[float, float, float, float],
+                engine: str = "auto", target_height: float = 96.0,
+                max_side: int = MAX_ANALYZE_SIDE) -> Dict:
+    """把一行字裁出来放大后重认，返回若干候选读法供前端裁决。
+
+    整图 OCR 的输入尺度对小字很不友好：字高只有二三十像素时，模型看到的笔画已经糊成一团，
+    「刻」认成「翅」这种错就来了。单独裁出来 Lanczos 放大再认，识别率高得多。
+
+    不在这里下结论选哪个读法：不同引擎的置信度不是一个量纲（实测 RapidOCR 给 0.82 的
+    「爱限」是错的，Vision 给 0.3 的「受限」才对），跨引擎比分数会挑错。所以把去重后的
+    候选连同票数一起返回，由前端拿各自渲染出来和原图笔画比对，谁更像选谁。
+    """
+    analyze, _bgra, _scale = load_image(image_path, max_side=max_side)
+    h, w = analyze.shape[:2]
+    x, y, rw, rh = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+    pad = max(4.0, min(rw, rh) * 0.18)
+    x0 = int(max(0, math.floor(x - pad)))
+    y0 = int(max(0, math.floor(y - pad)))
+    x1 = int(min(w, math.ceil(x + rw + pad)))
+    y1 = int(min(h, math.ceil(y + rh + pad)))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return {"text": "", "conf": 0.0, "engine": "", "scales": [], "candidates": []}
+
+    crop = analyze[y0:y1, x0:x1]
+    ink_h = max(6.0, _ink_height(crop))
+    names = ocr_engines.available_engine_names() if engine == "auto" else [engine]
+
+    # 一个尺度可能刚好把某个字认坏，多给两档（够大 / 更大）再投票
+    scales = sorted({round(float(np.clip(t / ink_h, 1.0, 10.0)), 2)
+                     for t in (target_height, target_height * 1.75)})
+    pool: Dict[str, Dict] = {}
+    for s in scales:
+        img = crop if s <= 1.01 else cv2.resize(crop, None, fx=s, fy=s,
+                                                interpolation=cv2.INTER_LANCZOS4)
+        for name in names:
+            try:
+                lines, _used = ocr_engines.detect_text(img, engine=name,
+                                                       multi_scale=False, min_conf=0.05)
+            except Exception:  # noqa: BLE001  某个引擎挂了不该影响其它引擎
+                continue
+            if not lines:
+                continue
+            # 裁出来的是一行字，个别引擎会切成几段，按阅读顺序拼回去
+            lines.sort(key=lambda l: (round(l.bbox[1] / max(8.0, ink_h * s * 0.6)), l.bbox[0]))
+            text = "".join(l.text for l in lines).strip()
+            if not text:
+                continue
+            conf = float(sum(l.conf for l in lines) / len(lines))
+            slot = pool.setdefault(text, {"text": text, "conf": 0.0, "votes": 0,
+                                          "engines": [], "scales": []})
+            slot["conf"] = max(slot["conf"], round(conf, 4))
+            slot["votes"] += 1
+            if name not in slot["engines"]:
+                slot["engines"].append(name)
+            slot["scales"].append(s)
+
+    candidates = sorted(pool.values(), key=lambda c: (-c["votes"], -c["conf"]))
+    best = candidates[0] if candidates else {"text": "", "conf": 0.0, "engines": []}
+    return {
+        "text": best["text"],
+        "conf": best["conf"],
+        "engine": (best.get("engines") or [""])[0],
+        "inkHeight": round(ink_h, 1),
+        "scales": scales,
+        "candidates": candidates,
     }
 
 

@@ -28,6 +28,8 @@
     <button class="tool" data-mode="cutout" title="框选抠取元素：把图上任意区域变成独立图层"><span>✂</span>抠取</button>
     <button class="tool" data-mode="erase" title="框选擦除：把区域内容按背景补干净"><span>◧</span>擦除</button>
     <span class="divider"></span>
+    <button class="tool" id="btnSharpen" title="把还没动过的文字全部用识别出的字体重画成清晰文字（⌘K）；单段文字双击它即可" disabled><span>✦</span>文字转清晰</button>
+    <span class="divider"></span>
     <button class="tool" id="btnUndo" title="撤销 (⌘Z)" disabled><span>↶</span></button>
     <button class="tool" id="btnRedo" title="重做 (⇧⌘Z)" disabled><span>↷</span></button>
   </div>
@@ -94,7 +96,7 @@
         <button class="mini wide" id="btnZoomFit">适应</button>
         <button class="mini wide" id="btnZoom100">1:1</button>
       </div>
-      <div class="hint" id="statusHint">拖拽移动 · 双击文字改内容 · ⌘滚轮缩放 · 空格拖拽平移</div>
+      <div class="hint" id="statusHint">拖拽移动 · 双击文字自动转清晰并可改内容 · ⌘滚轮缩放 · 空格拖拽平移</div>
       <div class="canvas-meta" id="canvasMeta"></div>
     </div>
 

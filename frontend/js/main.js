@@ -12,7 +12,7 @@ import {
 } from './render.js';
 import { CanvasController } from './interact.js';
 import { LayerPanel, PropPanel } from './panels.js';
-import { calibrateFonts } from './fontmatch.js';
+import { calibrateFonts, scoreText } from './fontmatch.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -129,6 +129,8 @@ class App {
     $('btnRedo').onclick = () => this.redo();
     $('btnReexplode').onclick = () => this.openExplodeModal();
 
+    $('btnSharpen').onclick = () => this.sharpenAllText();
+
     $('btnLayerUp').onclick = () => this.moveSelection(1);
     $('btnLayerDown').onclick = () => this.moveSelection(-1);
     $('btnLayerDelete').onclick = () => this.deleteSelection();
@@ -181,7 +183,7 @@ class App {
       b.classList.toggle('active', b.dataset.mode === mode);
     });
     const hints = {
-      select: '拖拽移动 · 双击文字改内容 · ⌘滚轮缩放 · 空格拖拽平移',
+      select: '拖拽移动 · 双击文字自动转清晰并可改内容 · ⌘滚轮缩放 · 空格拖拽平移',
       text: '在画布上拖出一个框来放置新文字',
       rect: '在画布上拖出矩形',
       ellipse: '在画布上拖出椭圆',
@@ -452,6 +454,7 @@ class App {
     $('btnExport').disabled = false;
     $('btnReexplode').disabled = false;
     $('btnSaveProject').disabled = false;
+    $('btnSharpen').disabled = false;
 
     this.canvas.fit();
     this.updateZoomLabel();
@@ -483,6 +486,143 @@ class App {
     } finally {
       this.busy(false);
     }
+  }
+
+  /* ---------------- 文字转清晰 ---------------- */
+
+  /**
+   * 把文字层从「原图像素」切成「矢量重绘」，不改一个字。
+   *
+   * 原图分辨率低或被压过的那几行字，画面上是一团糊的像素；换成标定好的字体按原字号
+   * 重画一遍就锐利了。字体、字重、颜色、字距都沿用炸开时量出来的结果，并打开贴合原始
+   * 墨迹宽度，所以只会变清楚，不会挪位置、不会变大小。
+   */
+  sharpenText(layers, { reread = true } = {}) {
+    const list = (Array.isArray(layers) ? layers : [layers]).filter(
+      (l) => l && l.type === 'text' && !l.locked && l.textMode === 'pixel'
+        && String(l.text ?? '').trim(),
+    );
+    if (!list.length) return 0;
+
+    // 先立刻切矢量画出来 —— 双击就该马上变清晰，不能等网络
+    for (const l of list) {
+      l.textMode = 'vector';
+      l.autoFit = true;
+      markDirty(l);
+    }
+    this.history.push(this.doc, list.length > 1 ? `${list.length} 段文字转清晰` : '文字转清晰');
+    this.refreshLayerPanel();
+    this.requestRender();
+
+    if (list.length === 1) {
+      const l = list[0];
+      const font = l.fontMatch?.label || l.fontFamily.replace(/["']/g, '').split(',')[0];
+      this.toast(`已转清晰文字：${font} ${l.fontWeight} · ${Math.round(l.fontSize)}px`, 'ok');
+    } else {
+      this.toast(`已把 ${list.length} 段文字转成清晰重绘`, 'ok');
+    }
+
+    // 糊字最怕的不是不清晰，是被 OCR 认错后画成「清晰的错字」，比糊着更难发现。
+    // 置信度不高的行在后台放大重认一遍，读法确实更像原图才替换。
+    if (reread) {
+      const weak = list.filter((l) => (l.confidence ?? 1) < 0.9
+        || (l.fontMatch && l.fontMatch.iou < 50));
+      if (weak.length) this.rereadTexts(weak);
+    }
+    return list.length;
+  }
+
+  /** 一次把全图还没动过的文字都转清晰（整张图都糊的时候用） */
+  sharpenAllText() {
+    if (!this.doc?.isReady) { this.toast('先炸开一张图片', 'err'); return; }
+    const n = this.sharpenText(this.doc.layers.filter((l) => l.type === 'text' && l.visible));
+    if (!n) this.toast('没有还需要转清晰的文字层');
+  }
+
+  /** 批量重认，最多三个并发，边认边改 */
+  async rereadTexts(layers) {
+    if (this._rereading || !layers.length) return;
+    this._rereading = true;
+    const heavy = layers.length > 2;
+    if (heavy) this.busy(true, `正在放大重认 ${layers.length} 段糊字…`);
+    const fixes = [];
+    const queue = [...layers];
+    const worker = async () => {
+      while (queue.length) {
+        const l = queue.shift();
+        try {
+          const fix = await this.rereadOne(l);
+          if (fix) {
+            fixes.push(fix);
+            this.requestRender();
+          }
+        } catch (err) {
+          console.warn('放大重认失败', err);
+        }
+        if (heavy) {
+          this.el.busyText.textContent = `正在放大重认糊字… 还剩 ${queue.length} 段`;
+        }
+      }
+    };
+    try {
+      await Promise.all(Array.from({ length: Math.min(3, layers.length) }, worker));
+    } finally {
+      if (heavy) this.busy(false);
+      this._rereading = false;
+    }
+    if (!fixes.length) return;
+    this.history.push(this.doc, '校正识别文字');
+    this.refreshLayerPanel();
+    this.requestRender();
+    const shown = fixes.slice(0, 3).map((f) => `${f.from} → ${f.to}`).join('、');
+    this.toast(`放大重认修正了 ${fixes.length} 处识别：${shown}${
+      fixes.length > 3 ? ' 等' : ''}`, 'ok');
+  }
+
+  /**
+   * 单行放大重认：后端把这行裁出来放大后多引擎多尺度各认一遍给出候选，
+   * 这里把每个候选按本层字体渲染出来和原图墨迹比对，明显更像才替换。
+   */
+  async rereadOne(layer) {
+    const jobId = this.doc.jobId;
+    if (!jobId) return null;
+    const ink = layer.inkBox || [layer.ox, layer.oy, layer.ow, layer.oh];
+    const res = await fetch('/api/reread-text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobId, rect: ink }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+
+    const current = String(layer.text ?? '');
+    const texts = [...new Set([current, ...(data.candidates || []).map((c) => c.text)])]
+      .filter((t) => t && t.trim());
+    if (texts.length < 2) return null;
+
+    // 按「渲染出来和原图墨迹的重合度」排名。用纯 IoU 而不是综合分：几个候选往往只差一两个
+    // 字，宽高比和墨量几乎一样，混进去只会把那一笔的差别摊薄。
+    const ranked = texts
+      .map((t) => ({ text: t, iou: scoreText(this.doc, layer, t)?.iou ?? -1 }))
+      .sort((a, b) => b.iou - a.iou);
+    const now = ranked.find((r) => r.text === current);
+    // 少字比认错更糟（整段话会缺一截），明显变短的候选一律不要
+    const best = ranked.find((r) => r.text !== current
+      && [...r.text].length >= [...current].length * 0.6);
+    // 要相对好过 2% 才改：差在千分之几时属于噪声，宁可留着 OCR 的原读法
+    if (!best || !now || best.iou < now.iou * 1.02) return null;
+
+    // 图层名是炸开时按 OCR 文字起的，跟着改掉，否则左侧列表里还挂着错字
+    const flat = (s) => s.split(/\s+/).join(' ');
+    if (layer.name === flat(current) || layer.name === `${flat(current).slice(0, 12)}…`) {
+      const next = flat(best.text);
+      layer.name = next.length <= 12 ? next : `${next.slice(0, 12)}…`;
+    }
+    layer.text = best.text;
+    markDirty(layer);
+    if (layer.fontMatch) layer.fontMatch = { ...layer.fontMatch, iou: Math.round(best.iou * 100) };
+    this.canvas.syncInlineText(layer);
+    return { from: current, to: best.text };
   }
 
   /* ---------------- 图层操作 ---------------- */

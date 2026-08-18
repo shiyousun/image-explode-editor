@@ -345,6 +345,19 @@ export function scoreFor(doc, layer, family, weight) {
                         !!layer.italic, layer.letterSpacing || 0);
 }
 
+/**
+ * 量化「用这一层的字体写出某段文字」和原图笔画的吻合度。
+ *
+ * 用来裁决 OCR 的几种读法：糊字重认时后端会给出「受限 / 爱限 / 亞限」这类候选，
+ * 跨引擎比置信度会挑错，但把每个候选照原字体渲染出来和原图墨迹比一比，谁更像一眼可分。
+ */
+export function scoreText(doc, layer, text) {
+  const mask = refMaskFromSlice(doc, layer);
+  if (!mask || !String(text || '').trim()) return null;
+  return scoreCandidate(prepareRef(mask), text, layer.fontFamily, layer.fontWeight,
+                        !!layer.italic, layer.letterSpacing || 0);
+}
+
 /** 调参用：把某一层对所有候选字体的打分排名和参考掩码统计倒出来 */
 export function diagnose(doc, layer) {
   const mask = refMaskFromSlice(doc, layer);

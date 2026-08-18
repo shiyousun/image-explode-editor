@@ -191,6 +191,26 @@ function measureRun(ctx, text, spacing) {
   return w - spacing;
 }
 
+/**
+ * 一行字「看得见的那部分」有多宽。
+ *
+ * 排版宽度含首尾两侧的字符边距，拿它去对原图量出来的墨迹宽度会系统性偏大：全角括号的
+ * 字面只占 em 框的一半，「（2024-2032）」两头就白搭进去七十多像素，照排版宽度贴合会把
+ * 中间的数字挤瘦一圈。墨迹对墨迹才是同一把尺子。
+ */
+function measureInkRun(ctx, text, spacing) {
+  const adv = measureRun(ctx, text, spacing);
+  const chars = [...text];
+  if (!chars.length) return adv;
+  const first = ctx.measureText(chars[0]);
+  const last = ctx.measureText(chars[chars.length - 1]);
+  const leftGap = Number.isFinite(first.actualBoundingBoxLeft)
+    ? Math.max(0, -first.actualBoundingBoxLeft) : 0;
+  const rightGap = Number.isFinite(last.actualBoundingBoxRight)
+    ? Math.max(0, last.width - last.actualBoundingBoxRight) : 0;
+  return Math.max(1, adv - leftGap - rightGap);
+}
+
 function drawRun(ctx, text, x, y, spacing, mode) {
   if (!text) return;
   if (!spacing) {
@@ -216,7 +236,7 @@ function computeFitSpacing(ctx, layer, targetWidth) {
   const longest = lines.reduce((a, b) => (b.length > a.length ? b : a), '');
   const count = [...longest].length;
   if (count < 2 || targetWidth <= 0) return 0;
-  const natural = measureRun(ctx, longest, layer.letterSpacing || 0);
+  const natural = measureInkRun(ctx, longest, layer.letterSpacing || 0);
   if (natural <= 0) return 0;
   const delta = (targetWidth - natural) / (count - 1);
   // 钳位收在 0.12 字号（约合排版上的 ±120‰ 字距）以内。原先放到 0.4 字号，
@@ -224,6 +244,23 @@ function computeFitSpacing(ctx, layer, targetWidth) {
   // 挤成一行相互压边的窄体。宁可宽度差几个百分点，也不能把字形挤变形。
   const limit = layer.fontSize * 0.12;
   return Math.max(-limit, Math.min(limit, delta));
+}
+
+/**
+ * 字距贴合到顶还是明显超出原始宽度时，把字号往回压一点。
+ *
+ * 字号是拿墨迹高度反推的，行里混进全角括号、引号这类比数字高的字符时会被顶大一截：
+ * 「（2024-2032）」量出 61px，其实数字只有 47px 的字面，重画出来整行比原文长 50px。
+ * 与其让它涨出去压到旁边的字，不如按宽度比例缩回来，上限 14%，超出说明是别的问题
+ * （字体差异或 OCR 少认了字），那就宁可留着宽度差，不要把字号越改越小。
+ */
+function fitScale(ctx, layer, g, spacing) {
+  const lines = String(layer.text ?? '').split('\n');
+  const longest = lines.reduce((a, b) => (b.length > a.length ? b : a), '');
+  if (!longest || g.inkW <= 0) return 1;
+  const w = measureInkRun(ctx, longest, spacing);
+  if (w <= g.inkW * 1.03) return 1;
+  return Math.max(0.86, g.inkW / w);
 }
 
 /** 矢量文字的绘制信息（含缩放与对齐锚点） */
@@ -265,6 +302,23 @@ function snapBaseline(ctx, layer, g, firstLine) {
   return g.iy + g.inkH * (ascent / drawn);
 }
 
+/**
+ * 让重绘的文字左边缘落回原位（左对齐时）。
+ *
+ * 原图量出来的墨迹框是「看得见的笔画」的边界，而 Canvas 从笔位开始画字，中间还隔着字符
+ * 自己的左边距。全角括号这类字符的字面只占 em 框右半边，左边距能有半个字宽：实测
+ * 「（2024-2032）」按墨迹框左沿开画，视觉上整串右移 41px，标题和括号之间凭空多出一道缝。
+ * 用 actualBoundingBoxLeft 把这段边距抵掉即可，和字体、字号无关。
+ */
+function snapInkLeft(ctx, layer, g, firstLine) {
+  if (!firstLine || (layer.align && layer.align !== 'left')) return g.anchorX;
+  const bearing = ctx.measureText(firstLine[0]).actualBoundingBoxLeft;
+  if (!Number.isFinite(bearing)) return g.anchorX;
+  // actualBoundingBoxLeft 以「向左为正」计量：为负说明字面落在笔位右边，把这段空档收掉；
+  // 为正是 f、J 这类字面向左悬挑的西文字符，原样画反而更贴原图
+  return bearing < 0 ? g.anchorX + bearing : g.anchorX;
+}
+
 function drawVectorText(ctx, layer) {
   const g = textGeometry(layer);
   const lines = String(layer.text ?? '').split('\n');
@@ -278,23 +332,33 @@ function drawVectorText(ctx, layer) {
     ctx.translate(-g.anchorX, 0);
   }
 
-  ctx.font = fontString(layer, g.size);
+  let size = g.size;
+  ctx.font = fontString(layer, size);
   ctx.textAlign = layer.align === 'center' ? 'center' : (layer.align === 'right' ? 'right' : 'left');
   ctx.textBaseline = 'alphabetic';
 
   let spacing = (layer.letterSpacing || 0) * g.sy;
   if (layer.autoFit) {
-    const fit = computeFitSpacing(ctx, { ...layer, fontSize: g.size,
-      letterSpacing: spacing }, g.inkW);
-    spacing += fit;
+    const base = (layer.letterSpacing || 0) * g.sy;
+    spacing = base + computeFitSpacing(ctx, { ...layer, fontSize: size,
+      letterSpacing: base }, g.inkW);
+    const scale = fitScale(ctx, layer, g, spacing);
+    if (scale < 1) {
+      size *= scale;
+      ctx.font = fontString(layer, size);
+      spacing = base * scale;
+      spacing += computeFitSpacing(ctx, { ...layer, fontSize: size,
+        letterSpacing: spacing }, g.inkW);
+    }
   }
 
-  const lineStep = g.size * (layer.lineHeight || 1.25);
+  const lineStep = size * (layer.lineHeight || 1.25);
   const baseline = snapBaseline(ctx, layer, g, lines[0]);
+  const anchorX = snapInkLeft(ctx, layer, g, lines[0]);
   lines.forEach((line, i) => {
     const y = baseline + i * lineStep;
     // 手动字距时 textAlign 失效，需自己算行首位置
-    let x = g.anchorX;
+    let x = anchorX;
     if (spacing) {
       const w = measureRun(ctx, line, spacing);
       if (layer.align === 'center') x = g.anchorX - w / 2;
@@ -324,8 +388,13 @@ export function textWidthDrift(ctx, layer) {
   let spacing = (layer.letterSpacing || 0) * g.sy;
   if (layer.autoFit) {
     spacing += computeFitSpacing(ctx, { ...layer, fontSize: g.size, letterSpacing: spacing }, g.inkW);
+    const scale = fitScale(ctx, layer, g, spacing);
+    if (scale < 1) {
+      ctx.font = fontString(layer, g.size * scale);
+      spacing *= scale;
+    }
   }
-  const w = measureRun(ctx, longest, spacing);
+  const w = measureInkRun(ctx, longest, spacing);
   ctx.restore();
   return g.inkW > 0 ? (w - g.inkW) / g.inkW : 0;
 }

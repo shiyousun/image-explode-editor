@@ -433,6 +433,8 @@ export class CanvasController {
   beginEdit(layer) {
     this.commitEdit();
     this.select([layer]);
+    // 双击即转清晰：原图那行字糊的话，不用改任何内容就先变锐利，光标同时落进去随手可改
+    this.app.sharpenText(layer);
     const ta = this.app.el.inlineEditor;
     const ink = layer.inkBox || [layer.x, layer.y, layer.w, layer.h];
     const sx = layer.ow > 0 ? layer.w / layer.ow : 1;
@@ -478,6 +480,19 @@ export class CanvasController {
     ta.onblur = () => this.commitEdit();
   }
 
+  /**
+   * 程序改掉文字时同步内联编辑框（糊字重认修正会走到这）。
+   * 不同步的话编辑框里还是旧内容，接着打一个字就把修正覆盖回去了。
+   */
+  syncInlineText(layer) {
+    if (!this.editing || this.editing.layer !== layer) return;
+    const ta = this.app.el.inlineEditor;
+    const atEnd = ta.selectionStart === ta.value.length;
+    ta.value = layer.text ?? '';
+    this.editing.original = layer.text;
+    if (atEnd) ta.setSelectionRange(ta.value.length, ta.value.length);
+  }
+
   commitEdit() {
     if (!this.editing) return;
     const { layer, original } = this.editing;
@@ -511,6 +526,13 @@ export class CanvasController {
     if (meta && e.key.toLowerCase() === 'z') {
       e.preventDefault();
       if (e.shiftKey) this.app.redo(); else this.app.undo();
+      return;
+    }
+    if (meta && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      // 选中了文字就只转选中的，什么都没选就整图转
+      const sel = this.selected.filter((l) => l.type === 'text');
+      if (sel.length) this.app.sharpenText(sel); else this.app.sharpenAllText();
       return;
     }
     if (meta && e.key.toLowerCase() === 'a') { e.preventDefault(); this.selectAll(); return; }

@@ -383,10 +383,14 @@ export class PropPanel {
             （字形吻合度 ${l.fontMatch.iou}%）<br>` : ''}
           渲染模式：<strong>${l.textMode === 'pixel' ? '原始像素（未改动）' : '矢量文字（可编辑）'}</strong><br>
           ${l.textMode === 'pixel'
-            ? '还没改动这行字，画面上用的是原图像素，与原图完全一致。改字或改样式后会自动切成矢量渲染。'
+            ? '还没改动这行字，画面上用的是原图像素，与原图完全一致。原图这行字糊的话，双击它（或按下面的按钮）就会用识别出的字体重画成清晰文字。'
             : `重排宽度相对原始墨迹 ${(drift * 100).toFixed(1)}%${
                 Math.abs(drift) > 0.06 ? '，差异偏大，可换字体或打开自动贴合' : '，贴合良好'}`}
         </div>
+        ${l.textMode === 'pixel' ? `
+        <div class="btn-row" style="margin-top:7px">
+          <button class="tool" id="tSharpen">✦ 转成清晰文字</button>
+        </div>` : ''}
         ${l.textMode !== 'pixel' && l.sliceUrl ? `
         <div class="btn-row" style="margin-top:7px">
           <button class="tool" id="tRevertPixel">还原成原始像素</button>
@@ -660,6 +664,11 @@ export class PropPanel {
 
     q('#tAutoFit')?.addEventListener('change', (e) => {
       l.autoFit = e.target.checked; toVector(); live(); commit('自动贴合'); this.render();
+    });
+
+    q('#tSharpen')?.addEventListener('click', () => {
+      app.sharpenText(l);
+      this.render();
     });
 
     q('#tRevertPixel')?.addEventListener('click', () => {

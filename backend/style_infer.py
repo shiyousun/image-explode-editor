@@ -65,6 +65,7 @@ class RegionAnalysis:
     alpha: np.ndarray                   # patch 坐标系下的软 alpha 0~255
     patch_rect: Tuple[int, int, int, int]
     rgba: Optional[np.ndarray] = None    # 抠出的 RGBA 切片（patch 尺寸）
+    erase_mask: Optional[np.ndarray] = None  # 擦除用掩码：比 mask 多盖住光晕与糊边
 
 
 # --------------------------------------------------------------------------- #
@@ -124,6 +125,16 @@ def _drop_tiny_components(mask: np.ndarray, min_area: float) -> np.ndarray:
     for i in range(1, num):
         if stats[i, cv2.CC_STAT_AREA] >= min_area:
             out[labels == i] = 255
+    return out
+
+
+def _components_touching(mask: np.ndarray, seed: np.ndarray) -> np.ndarray:
+    """只保留与 seed 相连的连通块，用来把「属于这行字的光晕」和邻近元素分开。"""
+    num, labels, _stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    keep = np.unique(labels[(seed > 0) & (labels > 0)])
+    out = np.zeros_like(mask)
+    for i in keep:
+        out[labels == i] = 255
     return out
 
 
@@ -437,10 +448,15 @@ def analyze_text_region(image_bgr: np.ndarray, line: TextLine) -> Optional[Regio
 
     # 线性色彩解混得到软 alpha：p = a*fg + (1-a)*bg
     denom = float(np.dot(diff, diff))
+    halo = None
     if denom > 1e-3:
         flat = patch.astype(np.float32).reshape(-1, 3) - bg_bgr
         alpha_f = (flat @ diff) / denom
         alpha = np.clip(alpha_f.reshape(ph, pw), 0.0, 1.0)
+        # 擦除要盖住光晕：低分辨率图里的字、带发光的字，软边能拖到笔画粗细的量级，
+        # 只擦硬掩码会在底板上留一层能读出原文的鬼影。这里趁 alpha 还没被裁窄先取出来，
+        # 并且只留与硬掩码相连的部分，免得把旁边的元素也当成自己的光晕。
+        halo = _components_touching((alpha >= 0.10).astype(np.uint8) * 255, text_mask)
         # 用硬掩码抑制背景噪声：仅在墨迹附近保留软 alpha
         near = cv2.dilate(text_mask, np.ones((3, 3), np.uint8), iterations=1)
         alpha = alpha * (near > 0)
@@ -499,8 +515,15 @@ def analyze_text_region(image_bgr: np.ndarray, line: TextLine) -> Optional[Regio
         rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
         rgba[:, :, :3] = rgb
 
+    erase_mask = cv2.bitwise_or(text_mask, halo) if halo is not None else text_mask.copy()
+    grow = int(round(min(max(1.0, stroke * 0.8), max(1.0, ink_h * 0.15))))
+    if grow >= 1:
+        k = np.ones((grow * 2 + 1, grow * 2 + 1), np.uint8)
+        erase_mask = cv2.dilate(erase_mask, k, iterations=1)
+
     return RegionAnalysis(style=style, mask=text_mask, alpha=alpha_u8,
-                          patch_rect=(px, py, pw, ph), rgba=rgba)
+                          patch_rect=(px, py, pw, ph), rgba=rgba,
+                          erase_mask=erase_mask)
 
 
 # --------------------------------------------------------------------------- #

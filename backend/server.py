@@ -162,6 +162,30 @@ def do_extract(payload: Dict = Body(...)) -> Dict:
     return layer
 
 
+@app.post("/api/reread-text")
+def reread_text(payload: Dict = Body(...)) -> Dict:
+    """把一行字单独放大重认一遍，专治糊字被认错。
+
+    整图 OCR 是按整张图的尺度跑的，图小或字被压花时容易读错（「光刻机」读成「光翅机」）。
+    单独把这一块裁出来放大到足够高，再让所有可用引擎各认一次择优，识别率明显更高。
+    """
+    job_id = payload.get("jobId", "")
+    job_dir = job_path(job_id)
+    src = find_source(job_dir)
+    rect = payload.get("rect") or []
+    if len(rect) != 4:
+        raise HTTPException(status_code=400, detail="rect 需为 [x, y, w, h]")
+    try:
+        result = exploder.reread_text(
+            src, tuple(float(v) for v in rect),
+            engine=payload.get("engine", "auto"),
+            target_height=float(payload.get("targetHeight", 96)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"重认失败：{exc}")
+    return result
+
+
 @app.post("/api/erase")
 def do_erase(payload: Dict = Body(...)) -> Dict:
     """按矩形列表重算干净背景，用于手动补擦除。"""
