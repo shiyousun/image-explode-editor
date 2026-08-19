@@ -105,8 +105,30 @@ def _dominant_background(labels: np.ndarray) -> int:
 Candidate = Tuple[np.ndarray, Rect, Optional[Tuple[int, int, int]]]
 
 
+def _looks_like_backdrop(bbox: Rect, area: float, ih: int, iw: int,
+                         max_area_ratio: float = 0.25) -> bool:
+    """这一块是「铺底的背景」而不是「摆在背景上的东西」吗？
+
+    背景要么摊得很大，要么至少压住两条画布边；摆在上面的卡片、图标都是浮在中间的小块。
+    用来把背景色那一类里真正的底板剔掉，同时留下藏在同一类里的独立色块。
+    """
+    x, y, w, h = bbox
+    touches = (x <= 1) + (y <= 1) + (x + w >= iw - 1) + (y + h >= ih - 1)
+    return touches >= 2 or area > max_area_ratio * ih * iw
+
+
 def _candidates_from_quantization(labels: np.ndarray, centers: np.ndarray,
                                   bg_label: int, cfg: dict) -> List[Candidate]:
+    """颜色量化通道。
+
+    背景色那一类不再整类跳过，只逐个连通域剔掉真正铺底的部分。原因是「哪一类是背景」
+    判得并不总对：友哥那张预告图四周有一圈米色装饰边，浅灰系（卡片填充 + 卡片描边 +
+    米色边）被 K-means 归成一类，这一类因为压着四条画布边被判成背景，于是整类跳过——
+    五个灰色卡片连候选都进不了，一个也炸不出来。
+
+    背景的形态特征很稳（摊得极大或压住两条边以上），照形态剔比照类别剔安全得多：
+    判错了也只是多出几个候选，交给下游按真实色差筛，而不是让整批元素凭空消失。
+    """
     h, w = labels.shape
     total = h * w
     min_area = _min_area(cfg, total)
@@ -116,8 +138,6 @@ def _candidates_from_quantization(labels: np.ndarray, centers: np.ndarray,
     kernel = np.ones((3, 3), np.uint8)
 
     for label in range(int(labels.max()) + 1):
-        if label == bg_label:
-            continue
         band = (labels == label).astype(np.uint8) * 255
         if np.count_nonzero(band) < min_area:
             continue
@@ -131,8 +151,77 @@ def _candidates_from_quantization(labels: np.ndarray, centers: np.ndarray,
             if cw < min_side or ch < min_side:
                 continue
             cx, cy = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
+            if label == bg_label and _looks_like_backdrop((cx, cy, cw, ch), area, h, w):
+                continue
             local = (comp[cy:cy + ch, cx:cx + cw] == i).astype(np.uint8) * 255
             bgr = centers[label]
+            out.append((local, (cx, cy, cw, ch),
+                        (int(bgr[2]), int(bgr[1]), int(bgr[0]))))
+    return out
+
+
+def _candidates_from_background_split(image_bgr: np.ndarray, labels: np.ndarray,
+                                      bg_label: int, cfg: dict) -> List[Candidate]:
+    """把「被归进背景那一类」的像素再细分一次颜色，捞出与背景只差一点点的色块。
+
+    浅灰卡片摆在白底上，色差只有 12~19（不到 8%）。整图量化时 K-means 的类额要留给
+    真正拉得开的颜色（紫、橙、蓝），这点差别不值一类，于是卡片和白底被归进同一类——
+    量化通道看不见它；边界落差又远低于 Canny 的低阈值，边缘通道也看不见它。两路全瞎，
+    友哥那张预告图里五个灰卡片才一个都炸不出来。
+
+    既然它是被背景类吃掉的，那就只在背景类内部再细分一次：这个子集里的颜色跨度只有
+    那么一点，K-means 的类额全用来切它，浅灰自然就和白底分开了。深色底上的深灰块同理，
+    不限于浅色。
+
+    只细分背景类，是为了不动其他颜色的判定——已经分得出来的东西不去碰它。
+    """
+    h, w = labels.shape
+    total = h * w
+    bg_mask = labels == bg_label
+    bg_count = int(np.count_nonzero(bg_mask))
+    min_area = _min_area(cfg, total)
+    if bg_count < max(min_area * 4, 4000):
+        return []
+
+    pix = image_bgr[bg_mask].astype(np.float32)
+    # K-means 在几十万像素上跑没必要，随机取一批就足够定出子调色板
+    rng = np.random.default_rng(0)
+    sample = pix[rng.choice(pix.shape[0], 20000, replace=False)] if pix.shape[0] > 20000 else pix
+    k = int(cfg.get("bg_split_levels", 4))
+    if len(np.unique(sample.astype(np.int32), axis=0)) < k:
+        return []
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 14, 0.6)
+    _ret, _lab, centers = cv2.kmeans(sample, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+
+    dists = ((pix[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+    sub = np.argmin(dists, axis=1)
+    sub_map = np.full((h, w), -1, np.int32)
+    sub_map[bg_mask] = sub
+
+    max_area = cfg["max_area_ratio"] * total
+    min_side = int(cfg.get("min_side", 6))
+    out: List[Candidate] = []
+    kernel = np.ones((3, 3), np.uint8)
+    for s in range(k):
+        band = (sub_map == s).astype(np.uint8) * 255
+        if np.count_nonzero(band) < min_area:
+            continue
+        band = cv2.morphologyEx(band, cv2.MORPH_CLOSE, kernel)
+        num, comp, stats, _c = cv2.connectedComponentsWithStats(band, connectivity=8)
+        for i in range(1, num):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < min_area or area > max_area:
+                continue
+            cw, ch = int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT])
+            if cw < min_side or ch < min_side:
+                continue
+            cx, cy = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
+            # 子类里真正铺底的那部分照形态剔掉，不猜「哪个子类是背景」——
+            # 实测那张预告图里占地最大的子类恰好是卡片填充色，按占地猜会把卡片全丢掉。
+            if _looks_like_backdrop((cx, cy, cw, ch), area, h, w):
+                continue
+            local = (comp[cy:cy + ch, cx:cx + cw] == i).astype(np.uint8) * 255
+            bgr = centers[s]
             out.append((local, (cx, cy, cw, ch),
                         (int(bgr[2]), int(bgr[1]), int(bgr[0]))))
     return out
@@ -176,6 +265,24 @@ def _candidates_from_edges(image_bgr: np.ndarray, cfg: dict) -> List[Candidate]:
 # --------------------------------------------------------------------------- #
 # 形状判定
 # --------------------------------------------------------------------------- #
+
+def _fill_holes(mask_local: np.ndarray) -> np.ndarray:
+    """把掩码内部的孔补实（只重绘外轮廓，多个不连通部分各自保留）。
+
+    色块上压着文字时，颜色量化会把文字像素划给别的颜色，于是色块掩码在每个字的位置
+    都留一个孔。切片按掩码取 alpha，孔就是透明的——这个色块贴到画布上，字的形状处会
+    透出底下的白，看着就是「一块黄色色块上撒了一层白点点」。
+
+    一个圆角矩形本来就是实心的，它上面的字是另一个图层的事。所以判成图元之后把孔补上，
+    切片才是一整块干净的颜色。
+    """
+    contours, _ = cv2.findContours(mask_local, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return mask_local
+    filled = np.zeros_like(mask_local)
+    cv2.drawContours(filled, contours, -1, 255, thickness=cv2.FILLED)
+    return filled
+
 
 def _corner_radius(mask_local: np.ndarray) -> float:
     """沿四角对角线探测圆弧起点，反推圆角半径。"""
@@ -274,6 +381,19 @@ def classify_element(image_bgr: np.ndarray, mask_local: np.ndarray, bbox: Rect,
             kind = "icon"
         else:
             kind = "image"
+
+    # 图元（矩形/圆角矩形/椭圆）是实心的，掩码里的孔只可能是压在它上面的文字被量化
+    # 划走留下的。补实后切片才是纯净一块颜色。图标和图片不补——镂空图标中间的空、
+    # 照片里的透明区都是内容本身的一部分，补上就会糊住底下的东西。
+    if kind in ("rect", "rounded-rect", "ellipse"):
+        filled = _fill_holes(mask_local)
+        if np.count_nonzero(filled) > area:
+            mask_local = filled
+            area = float(np.count_nonzero(mask_local))
+            rect_fill = area / float(bw * bh)
+            if kind != "ellipse":
+                radius = _corner_radius(mask_local)
+                kind = "rounded-rect" if radius > 2.0 else "rect"
 
     return Element(kind=kind, bbox=bbox, mask=mask_local, fill=fill, radius=radius,
                    solid=solid, color_count=color_count,
@@ -679,8 +799,23 @@ def frame_ratio(el: Element) -> float:
     return 1.0 - int(np.count_nonzero(inner)) / ink
 
 
+def _edge_strip(image_bgr: np.ndarray, el: Element) -> bool:
+    """贴着画布边的一条又长又平的窄带——图片外围的装饰边、留白条那一类。
+
+    背景色那一类改成逐连通域筛之后，这种带子会漏进来：它压住一条画布边，长宽比 18:1
+    往上，内部一个梯度都没有。它不是画面里的东西，是画布本身的边饰，所以对它的
+    「看得见」门槛要提得比一般元素高。
+    """
+    ih, iw = image_bgr.shape[:2]
+    x, y, w, h = el.bbox
+    touches = (x <= 2) + (y <= 2) + (x + w >= iw - 2) + (y + h >= ih - 2)
+    aspect = max(w, h) / max(1, min(w, h))
+    return touches >= 1 and aspect >= 8.0 and el.meta.get("flatRatio", 0.0) > 0.80
+
+
 def drop_invisible_blocks(image_bgr: np.ndarray, elements: List[Element],
-                          min_contrast: float = 12.0) -> List[Element]:
+                          min_contrast: float = 12.0,
+                          strip_contrast: float = 20.0) -> List[Element]:
     """丢掉与周围颜色几乎一样、根本看不出边界的候选。
 
     深色渐变背景上，颜色量化会切出一堆规整的矩形，边缘检测也会沿着渐变等值线圈出空框。
@@ -692,7 +827,7 @@ def drop_invisible_blocks(image_bgr: np.ndarray, elements: List[Element],
     out: List[Element] = []
     for el in elements:
         c = surround_contrast(image_bgr, el)
-        if c < min_contrast:
+        if c < (strip_contrast if _edge_strip(image_bgr, el) else min_contrast):
             continue
         el.meta["contrast"] = round(c, 1)
         out.append(el)
@@ -777,6 +912,7 @@ def segment_elements(image_bgr: np.ndarray,
     raw: List[Candidate] = []
     if detect_shapes:
         raw.extend(_candidates_from_quantization(labels, centers, bg_label, cfg))
+        raw.extend(_candidates_from_background_split(image_bgr, labels, bg_label, cfg))
     raw.extend(_candidates_from_edges(image_bgr, cfg))
 
     elements: List[Element] = []

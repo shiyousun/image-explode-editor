@@ -101,7 +101,7 @@ function contentBox(l) {
  * 想要的（重绘也和原图一致），但只要那行字被改写、挪走或隐藏，就必须换成擦过字的那份，
  * 否则旧文字会跟着底板一起被画回来。元素自己被移动或缩放时同理。
  */
-function buildCleanSliceSet(doc) {
+export function buildCleanSliceSet(doc) {
   const set = new Set();
   for (const l of doc.layers) {
     if (!l.sliceCleanUrl) continue;
