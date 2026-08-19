@@ -284,6 +284,27 @@ def _fill_holes(mask_local: np.ndarray) -> np.ndarray:
     return filled
 
 
+def _robust_color_std(pixels: np.ndarray, keep_ratio: float = 90.0) -> float:
+    """这一片像素「是不是一种颜色」，按剔掉离群点之后的色散来判。
+
+    直接算标准差不行：色块上压着文字，文字周围总有一圈抗锯齿像素躲过文字掩码，几百个
+    深色像素就能把标准差从 2 抬到 20 以上，于是一块纯黄卡片被判成「不是纯色」→ 归成图标
+    → 丢掉图元该有的保护，接着被上排那个大块吞掉。实测同一张图换个尺寸就复现，因为 OCR
+    框的贴合程度会随尺寸变。
+
+    改成以中位色为中心，只统计距离在 90 分位以内的像素。纯色块剔掉那一成离群点后色散
+    ≈2；照片是连续宽谱的，剔一成照样在 40 以上，两类之间的空隙足够大。
+    """
+    if pixels.size == 0:
+        return 0.0
+    med = np.median(pixels, axis=0)
+    dist = np.linalg.norm(pixels - med, axis=1)
+    keep = pixels[dist <= np.percentile(dist, keep_ratio)]
+    if keep.shape[0] < 8:
+        keep = pixels
+    return float(np.max(np.std(keep, axis=0)))
+
+
 def _corner_radius(mask_local: np.ndarray) -> float:
     """沿四角对角线探测圆弧起点，反推圆角半径。"""
     h, w = mask_local.shape[:2]
@@ -330,7 +351,7 @@ def classify_element(image_bgr: np.ndarray, mask_local: np.ndarray, bbox: Rect,
             eval_mask = without_text
 
     pixels = sub_img[eval_mask > 0].astype(np.float32)
-    color_std = float(np.max(np.std(pixels, axis=0))) if pixels.size else 0.0
+    color_std = _robust_color_std(pixels)
     solid = color_std < 13.0
     median_rgb = None
     if pixels.size:
@@ -517,6 +538,24 @@ def _text_overlap(mask_local: np.ndarray, bbox: Rect,
         return 0.0
     inter = np.count_nonzero(cv2.bitwise_and(mask_local, guard))
     return inter / own
+
+
+def _text_backdrop(mask_local: np.ndarray, bbox: Rect, min_area: float,
+                   min_fill: float = 0.85) -> bool:
+    """文字压得多，但它本身是「一块底板」而不是「一行字」吗？
+
+    「文字覆盖过半就丢」这道门是为了不把文字行本身当成图形，可它会误伤压着文字的色块：
+    同一张图缩到 0.7 倍，右下角那块卡片只有 155×72，两行带拉丁字母的标题膨胀后盖掉它
+    一半以上，于是整块被当成文字丢掉——候选池里明明有它，IoU 0.97。
+
+    两者形态差得很远，但要在**补洞之后**比才看得出来：色块被文字掏空的是一个个封闭的孔，
+    补完就是实心（0.98）；一行字的字间空隙是通向外面的，补也补不满（实测 0.3~0.6）。
+    直接比原始填充率会漏——缩小后文字占比升高，那块卡片只剩 0.75，卡在门槛下面。
+    再要求面积到得了阈值的几倍，小字块就进不来。
+    """
+    _x, _y, w, h = bbox
+    ink = np.count_nonzero(_fill_holes(mask_local))
+    return ink >= min_area * 3 and ink / float(w * h) >= min_fill
 
 
 def _bbox_iou(a: Rect, b: Rect) -> float:
@@ -916,11 +955,17 @@ def segment_elements(image_bgr: np.ndarray,
     raw.extend(_candidates_from_edges(image_bgr, cfg))
 
     elements: List[Element] = []
+    min_area = _min_area(cfg, h * w)
     for mask_local, bbox, fill_hint in raw:
-        if _text_overlap(mask_local, bbox, text_guard) > 0.42:
-            continue
         el = classify_element(image_bgr, mask_local, bbox, fill_hint, text_guard)
         if el is None:
+            continue
+        # 文字盖了大半的候选一律丢掉，只给「压着文字的纯色底板」放行：它是 6 个色块
+        # 里最小那块能不能炸出来的关键，而判成图元这件事本身就是最硬的证据——一行字
+        # 的像素排除笔画后所剩无几，色散大，根本判不成纯色图元。
+        if _text_overlap(mask_local, bbox, text_guard) > 0.42 \
+                and not (el.kind in ("rect", "rounded-rect", "ellipse")
+                         and _text_backdrop(mask_local, bbox, min_area)):
             continue
         bx, by, bw, bh = el.bbox
         # 贴满整图三边以上的巨大区域视为整体背景，不作为元素
