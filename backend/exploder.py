@@ -239,15 +239,46 @@ def explode(image_path: str,
         cv2.imwrite(os.path.join(layers_dir, slice_name),
                     cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
 
-        # 压着文字的元素（横幅、按钮等）额外存一份「已擦字」切片：只有当它上面的
-        # 文字真的被改动或挪走时才用，否则原文字会随着这个元素一起被重新画回来。
+        # 独立元素切片必须只含元素本体，不能把压在上面的文字也烘进去。
+        #
+        # 图元已有可靠的填充色与完整轮廓，直接用「纯色 + 原 alpha 轮廓」生成隔离切片：
+        # 比从 clean_text 取像素更稳，OCR 漏掉半个字也不会把字残留带着走。图片/图标没有
+        # 可重建的纯色，仍从擦字图取；平时画布继续铺原图，只有元素被挪动/改色时才用这份，
+        # 所以未编辑状态照旧逐像素保真。
         slice_clean_name = None
-        if any(_rects_overlap(el.bbox, r) for r in text_boxes):
+        is_shape = el.kind in ("rect", "rounded-rect", "ellipse", "line") and el.fill is not None
+        if is_shape:
+            clean_rgba = rgba.copy()
+            clean_rgba[:, :, :3] = np.asarray(el.fill, dtype=np.uint8)
+            slice_clean_name = f"{lid}_clean.png"
+            cv2.imwrite(os.path.join(layers_dir, slice_clean_name),
+                        cv2.cvtColor(clean_rgba, cv2.COLOR_RGBA2BGRA))
+        elif any(_rects_overlap(el.bbox, r) for r in text_boxes):
             clean_rgba = segmenter.cutout_rgba(clean_text, el.mask, el.bbox, feather=0.8)
             slice_clean_name = f"{lid}_clean.png"
             cv2.imwrite(os.path.join(layers_dir, slice_clean_name),
                         cv2.cvtColor(clean_rgba, cv2.COLOR_RGBA2BGRA))
-        is_shape = el.kind in ("rect", "rounded-rect", "ellipse", "line") and el.fill is not None
+
+        # 图元再带一份「只擦掉它自己」的原位补丁。过去拖动后要等浏览器再请求 /api/erase，
+        # 请求回来前只能用 clean_all 顶着；大容器层若同时重画，会把原色块从原图切片里重新
+        # 带回来，看起来就是「挪走了，原位置还在」。预先生成的小补丁立即可用，也不受网络
+        # 与防抖时序影响。只给图元做，数量可控；照片/复杂图标仍走按需精确擦除。
+        erase_patch_name = None
+        erase_patch_rect = None
+        if is_shape:
+            pad = 4
+            ex0, ey0 = max(0, x - pad), max(0, y - pad)
+            ex1, ey1 = min(w, x + bw + pad), min(h, y + bh + pad)
+            erased = inpainter.build_clean_background(
+                analyze, [(el.mask, el.bbox)], dilate=2)
+            patch = erased[ey0:ey1, ex0:ex1]
+            patch_bgra = cv2.cvtColor(patch, cv2.COLOR_BGR2BGRA)
+            patch_bgra[:, :, 3] = bgra[ey0:ey1, ex0:ex1, 3]
+            erase_patch_name = f"{lid}_erase.png"
+            erase_patch_rect = [float(ex0), float(ey0),
+                                float(ex1 - ex0), float(ey1 - ey0)]
+            cv2.imwrite(os.path.join(layers_dir, erase_patch_name), patch_bgra)
+
         layers.append({
             "id": lid,
             "type": "shape" if is_shape else "image",
@@ -259,6 +290,8 @@ def explode(image_path: str,
             "radius": float(el.radius),
             "slice": f"layers/{slice_name}",
             "sliceClean": f"layers/{slice_clean_name}" if slice_clean_name else None,
+            "erasePatch": f"layers/{erase_patch_name}" if erase_patch_name else None,
+            "erasePatchRect": erase_patch_rect,
             "sliceRect": [float(x), float(y), float(bw), float(bh)],
             "kind": el.kind,
             "depth": el.depth,

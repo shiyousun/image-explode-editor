@@ -40,7 +40,8 @@ const SERIAL_KEYS = [
   'letterSpacing', 'lineHeight', 'align', 'baselineOffset', 'inkBox',
   'textMode', 'autoFit', 'fitSpacing', 'strokeColor', 'strokeWidth', 'fontMatch',
   'shape', 'fill', 'radius', 'shapeMode',
-  'filters', 'sliceUrl', 'sliceCleanUrl', 'srcUrl', 'kind', 'isCJK', 'confidence', 'quality',
+  'filters', 'sliceUrl', 'sliceCleanUrl', 'erasePatchUrl', 'erasePatchRect',
+  'srcUrl', 'kind', 'isCJK', 'confidence', 'quality',
   'bgColor', 'paragraph',
 ];
 
@@ -116,6 +117,8 @@ export function layerFromLayout(raw, jobId) {
     kind: raw.kind || raw.type,
     sliceUrl: raw.slice ? `/files/${jobId}/${raw.slice}` : null,
     sliceCleanUrl: raw.sliceClean ? `/files/${jobId}/${raw.sliceClean}` : null,
+    erasePatchUrl: raw.erasePatch ? `/files/${jobId}/${raw.erasePatch}` : null,
+    erasePatchRect: raw.erasePatchRect || null,
     srcUrl: null,
   };
 

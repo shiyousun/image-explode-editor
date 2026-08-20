@@ -46,7 +46,8 @@ export function buildDrawSet(doc, cleanSet = null) {
       const box = contentBox(l);
       for (const d of set) {
         // 补丁擦掉了这个图层在底图里的像素 -> 必须重画
-        const erased = needsPatch(d) && patchDamages(d, l, exact) && patchHits(box, d);
+        const below = idx.get(l.id) < idx.get(d.id);
+        const erased = needsPatch(d) && patchDamages(d, l, exact, below) && patchHits(box, d);
         // 下层图层重画后变了样，压在它上面的这层必须跟着重画回来
         const covered = d.visible && idx.get(d.id) < idx.get(l.id)
           && altersPixels(d, clean) && rectsIntersect(box, layerBox(d));
@@ -136,6 +137,8 @@ export function eraseRects(doc) {
   const rects = [];
   for (const l of doc.layers) {
     if (l.type === 'text' || !needsPatch(l)) continue;
+    // 图元在炸开时已经带了「只擦它自己」的原位补丁，不必再走异步 /api/erase。
+    if (l.erasePatchUrl && doc.images.has(l.erasePatchUrl)) continue;
     const r = patchRect(doc, l);
     if (r.w > 0 && r.h > 0) rects.push([r.x, r.y, r.w, r.h]);
   }
@@ -549,12 +552,27 @@ export function drawLayer(ctx, doc, layer, rc = null) {
 }
 
 function patchLayer(ctx, doc, layer) {
-  const src = layer.type === 'text'
+  const exactPatch = layer.erasePatchUrl && doc.images.get(layer.erasePatchUrl);
+  const src = exactPatch || (layer.type === 'text'
     ? (doc.cleanTextImg || doc.cleanAllImg)
-    : (activeCleanImage(doc) || doc.cleanAllImg || doc.cleanTextImg);
+    : (activeCleanImage(doc) || doc.cleanAllImg || doc.cleanTextImg));
   if (!src) return;
-  const { x, y, w, h } = patchRect(doc, layer);
+  const pr = exactPatch && layer.erasePatchRect
+    ? { x: layer.erasePatchRect[0], y: layer.erasePatchRect[1],
+        w: layer.erasePatchRect[2], h: layer.erasePatchRect[3] }
+    : patchRect(doc, layer);
+  const { x, y, w, h } = pr;
   if (w <= 0 || h <= 0) return;
+  const drawPatch = () => {
+    if (exactPatch) {
+      // 专用补丁本身就是裁好的小图，源坐标必须从 (0,0) 取；x/y 只用于落到画布。
+      // 沿用整幅 clean 背景的九参数写法会从小图的第 x/y 像素开始裁，直接落在图外，
+      // 结果是「补丁存在但一像素都没画」，原色块当然还留在原位。
+      ctx.drawImage(src, 0, 0, src.naturalWidth, src.naturalHeight, x, y, w, h);
+    } else {
+      ctx.drawImage(src, x, y, w, h, x, y, w, h);
+    }
+  };
 
   // 圆形、圆角块只擦掉形状本身。按外接矩形擦会连四角一起抹掉，紧挨着的文字会被
   // 迫使重画一遍，边缘因此变毛。
@@ -563,11 +581,11 @@ function patchLayer(ctx, doc, layer) {
     ctx.save();
     path(ctx);
     ctx.clip();
-    ctx.drawImage(src, x, y, w, h, x, y, w, h);
+    drawPatch();
     ctx.restore();
     return;
   }
-  ctx.drawImage(src, x, y, w, h, x, y, w, h);
+  drawPatch();
 }
 
 /** 形状图层在原始位置的轮廓（外扩 pad 盖住抗锯齿边缘）；其他类型返回 null 走矩形。 */
@@ -601,16 +619,13 @@ function originShapePath(layer, pad) {
  * 缺口是照四周像素补出来的：把补丁范围整块罩住的底板（面板、卡片、大背景图）补完看不出
  * 差别，不用重画；而内容落在补丁范围里的图层，像素确实被填掉了，必须重画。
  */
-function patchDamages(d, l, exact = false) {
+function patchDamages(d, l, exact = false, below = false) {
   if (d.type === 'text') return l.type === 'text';
-  if (exact && contains(originBox(l), inflate(originBox(d)))) return false;
+  // 精确补丁本身就是「擦掉 d 之后的原图合成结果」，里面已经包含 d 下方的所有像素。
+  // 下层无论是完整包住 d 的容器，还是只与它重叠一部分，都不该再从原图切片重画；
+  // 一重画就会把刚擦掉的色块再次带回原位。上层（文字、图标）仍需重画回来。
+  if ((exact || d.erasePatchUrl) && below) return false;
   return true;
-}
-
-function contains(outer, inner) {
-  return outer.x <= inner.x && outer.y <= inner.y
-    && outer.x + outer.w >= inner.x + inner.w
-    && outer.y + outer.h >= inner.y + inner.h;
 }
 
 /** 补丁会不会擦到 box？圆形补丁按椭圆判定，否则按矩形。 */

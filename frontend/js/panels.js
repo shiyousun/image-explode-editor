@@ -70,7 +70,11 @@ export class LayerPanel {
       return `data:image/svg+xml,${encodeURIComponent(
         `<svg xmlns='http://www.w3.org/2000/svg' width='30' height='30'>${svg}</svg>`)}`;
     }
-    return layer.srcUrl || layer.sliceUrl || '';
+    // 图元缩略图展示「隔离后的元素本体」：色块上面的文字属于文字层，不该烘在色块缩略图里。
+    // 画布未编辑时仍由原图提供像素，改这里只影响图层面板如何表达炸开的结果。
+    return layer.srcUrl
+      || (layer.type === 'shape' ? layer.sliceCleanUrl : null)
+      || layer.sliceUrl || '';
   }
 
   render() {

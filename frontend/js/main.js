@@ -438,6 +438,9 @@ class App {
         if (l.sliceCleanUrl) {
           doc.images.set(l.sliceCleanUrl, await loadImage(l.sliceCleanUrl));
         }
+        if (l.erasePatchUrl) {
+          doc.images.set(l.erasePatchUrl, await loadImage(l.erasePatchUrl));
+        }
       } catch {
         l.textMode = 'vector';
         l.shapeMode = 'vector';
