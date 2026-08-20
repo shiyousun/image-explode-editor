@@ -7,7 +7,7 @@
 **最关键的一条**：没动过的地方与原图**逐像素完全一致**。不是"看起来差不多"，是导出后
 逐像素比对差异为 0。只有你真正改过的那几个元素才会被重新绘制。
 
-![效果对比](../explode_demo_compare.png)
+![效果对比](docs/images/explode_demo_compare.png)
 
 上图三段分别是：原图 / 改了 3 段文字 + 挪了 1 个图标 / 差异热区（红色是变化的像素，
 只占全图 4.14%，形状正好贴着改过的字与图标，其余分毫未动）。
@@ -54,9 +54,6 @@ cd image_explode_editor
 写入 `cursor_team/`。
 
 ## 部署到服务器
-
-已部署在 devcloud：**<http://21.91.41.143:8770/>**（腾讯内网可达；外网走隧道
-`ssh -p 36000 -L 8770:127.0.0.1:8770 root@21.91.41.143` 后开 <http://localhost:8770/>）。
 
 ```bash
 # 传源码（排除 venv / workspace，macOS 的 venv 不能带到 Linux）
@@ -115,7 +112,7 @@ cd /root/apps/cursor_team/image_explode_editor && ./run_linux.sh 8770
   叠成双影。
 - 每层带 `id` 和 `data-name`（图层名就是那句话），在矢量软件的图层树里一眼能找到要改的那句。
 
-![矢量放大对比](../svg_zoom_compare.png)
+![矢量放大对比](docs/images/svg_zoom_compare.png)
 
 同一段标题放大 4 倍：上面是 PNG 放大（边缘糊成一片），下面是 SVG 渲染（笔画依然是刀锋）。
 
@@ -337,8 +334,8 @@ image_explode_editor/
   在旧系统上能用，现在双击后 LaunchServices 一声不响什么都不做，`open` 还返回 0，
   极难查。`scripts/build_mac_app.sh` 改用 `osacompile` 生成 applet（自带官方二进制壳），
   脚本挂在它后面跑，不用编译器就能拿到合法 `.app`。顺手 ad-hoc 签一下，不签的新系统会挡。
-- **`lsof -ti tcp:8770` 会把出站连接也算进去**。本机连过远程服务器的 8770 之后，
-  浏览器进程一直挂着几条到 `21.91.41.143:8770` 的 CLOSED 记录，于是启动器以为本机端口被占，
+- **`lsof -ti tcp:8770` 会把出站连接也算进去**。本机访问过远程同端口服务之后，
+  浏览器进程可能一直挂着几条到远端 8770 的 CLOSED 记录，于是启动器误以为本机端口被占，
   莫名换到 8771，而人还在按 8770 找页面。必须加 `-sTCP:LISTEN` 只看真正在监听的。
 - **`nohup ... &` 挡不住进程组信号**。从 IDE 终端或脚本里启动时，那个会话一结束整组被收走，
   服务跟着断。改成让 python 用 `start_new_session=True` 起独立会话，关终端、关启动窗口
